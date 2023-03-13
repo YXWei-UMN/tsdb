@@ -123,6 +123,7 @@ func (s sample) V() float64 {
 	return s.v
 }
 
+// 既然是 Ring, 那么 buf 就是环装的, 因此有辅助的 i, f, l
 type sampleRing struct {
 	delta int64
 

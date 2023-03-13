@@ -51,7 +51,10 @@ const (
 )
 
 type indexWriterSeries struct {
+	// labels 的实际内容, 即 kv 对
 	labels labels.Labels
+
+	// 这里重要的实际是 Meta.Ref, 即每个 chunk 对应的文件/起点
 	chunks []chunks.Meta // series file offset of chunks
 }
 
@@ -147,11 +150,12 @@ type TOC struct {
 }
 
 // NewTOCFromByteSlice return parsed TOC from given index byte slice.
+// 由于index文件一旦形成之后就不再会改变，所以Prometheus也依旧使用mmap来进行操作。采用mmap读取TOC非常容易:
 func NewTOCFromByteSlice(bs ByteSlice) (*TOC, error) {
 	if bs.Len() < indexTOCLen {
 		return nil, encoding.ErrInvalidSize
 	}
-	b := bs.Range(bs.Len()-indexTOCLen, bs.Len())
+	b := bs.Range(bs.Len()-indexTOCLen, bs.Len()) // TOC(Table Of Content) 包含各index section的offset， indexTOCLen = 6*8+4 = 52
 
 	expCRC := binary.BigEndian.Uint32(b[len(b)-4:])
 	d := encoding.Decbuf{B: b[:len(b)-4]}
@@ -252,6 +256,7 @@ func (w *Writer) ensureStage(s indexWriterStage) error {
 	if w.stage == s {
 		return nil
 	}
+	// 排在当前阶段之前的, 不可再执行
 	if w.stage > s {
 		return errors.Errorf("invalid stage %q, currently at %q", s, w.stage)
 	}
@@ -269,6 +274,7 @@ func (w *Writer) ensureStage(s indexWriterStage) error {
 	case idxStagePostings:
 		w.toc.Postings = w.pos
 
+		// 执行到完成阶段时, 自动写入必要的辅助信息
 	case idxStageDone:
 		w.toc.LabelIndicesTable = w.pos
 		if err := w.writeLabelIndexesOffsetTable(); err != nil {
@@ -321,6 +327,7 @@ func (w *Writer) AddSeries(ref uint64, lset labels.Labels, chunks ...chunks.Meta
 	w.buf2.Reset()
 	w.buf2.PutUvarint(len(lset))
 
+	// 对于每个 label, 分别记录 它的 name 和 value 在索引文件中的位置
 	for _, l := range lset {
 		// here we have an index for the symbol file if v2, otherwise it's an offset
 		index, ok := w.symbols[l.Name]
@@ -338,6 +345,8 @@ func (w *Writer) AddSeries(ref uint64, lset labels.Labels, chunks ...chunks.Meta
 
 	w.buf2.PutUvarint(len(chunks))
 
+	// 对于 chunk 数据, 记录它覆盖的时间范围, 以及存储地址
+	// 除第一个 chunk 外, 其他记录的都是变化量
 	if len(chunks) > 0 {
 		c := chunks[0]
 		w.buf2.PutVarint64(c.MinTime)
@@ -370,6 +379,9 @@ func (w *Writer) AddSeries(ref uint64, lset labels.Labels, chunks ...chunks.Meta
 	return nil
 }
 
+// label 中的每一个键或值都是一个 symbol.
+//
+// 通过 "使用对 symbol 的引用" 的方式, 来缩减后续索引文件中的空间占用.
 func (w *Writer) AddSymbols(sym map[string]struct{}) error {
 	if err := w.ensureStage(idxStageSymbols); err != nil {
 		return err
@@ -401,6 +413,13 @@ func (w *Writer) AddSymbols(sym map[string]struct{}) error {
 	return errors.Wrap(err, "write symbols")
 }
 
+// 这里传入的参数可以认为是下述结构
+// 其中每一组 value 都是 names 的一组取值组合
+//
+//		type Label struct {
+//		 names []string
+//		 valus [][]string
+//	}
 func (w *Writer) WriteLabelIndex(names []string, values []string) error {
 	if len(values)%len(names) != 0 {
 		return errors.Errorf("invalid value list length %d for %d names", len(values), len(names))
@@ -420,6 +439,7 @@ func (w *Writer) WriteLabelIndex(names []string, values []string) error {
 		return err
 	}
 
+	// 所有 hash entry 会统一在后续阶段写入
 	w.labelIndexes = append(w.labelIndexes, labelIndexHashEntry{
 		keys:   names,
 		offset: w.pos,
@@ -503,6 +523,7 @@ func (w *Writer) writeTOC() error {
 	return w.write(w.buf1.Get())
 }
 
+// Postings 用来记录每一个 label (一对 name, value) 对应了哪些数据块, 用于检索
 func (w *Writer) WritePostings(name, value string, it Postings) error {
 	if err := w.ensureStage(idxStagePostings); err != nil {
 		return errors.Wrap(err, "ensure stage")
@@ -513,6 +534,7 @@ func (w *Writer) WritePostings(name, value string, it Postings) error {
 		return err
 	}
 
+	// 每一对 name-value 对应的数据位置
 	w.postings = append(w.postings, postingsHashEntry{
 		name:   name,
 		value:  value,
@@ -573,9 +595,11 @@ type postingsHashEntry struct {
 }
 
 func (w *Writer) Close() error {
+	// 这里会自动执行 labelIndexes, postings, toc 的写入
 	if err := w.ensureStage(idxStageDone); err != nil {
 		return err
 	}
+	// 文件落盘
 	if err := w.fbuf.Flush(); err != nil {
 		return err
 	}
@@ -682,6 +706,7 @@ func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 		return nil, errors.Errorf("unknown index file version %d", r.version)
 	}
 
+	// toc 在文件尾部, 且长度固定, 因此可以直接读出
 	toc, err := NewTOCFromByteSlice(b)
 	if err != nil {
 		return nil, errors.Wrap(err, "read TOC")
@@ -706,6 +731,10 @@ func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 	}
 
 	if err := ReadOffsetTable(r.b, toc.LabelIndicesTable, func(key []string, off uint64) error {
+		// 不知道这里为什么会强制长度为 1?
+		// 根据 Writer.WriteLabelIndex 的定义, 明显是支持多 names 的
+		// 实际验证, 多 names 写入没有问题, 但在读取的时候会在这里报错
+		// 等待后续看相关代码来理解吧.
 		if len(key) != 1 {
 			return errors.Errorf("unexpected key length for label indices table %d", len(key))
 		}

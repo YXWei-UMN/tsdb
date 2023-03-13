@@ -159,6 +159,7 @@ func newCRC32() hash.Hash32 {
 // SegmentWAL is a write ahead log for series data.
 //
 // DEPRECATED: use wal pkg combined with the record coders instead.
+// WAL接口有两个实现noWAL和SegmentWAL。noWAL即什么也不干的wal，所有方法几乎都是直接return,重点来看下SegmentWAL。
 type SegmentWAL struct {
 	mtx     sync.Mutex
 	metrics *walMetrics

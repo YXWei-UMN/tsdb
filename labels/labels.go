@@ -28,6 +28,12 @@ import (
 const sep = '\xff'
 
 // Label is a key/value pair of strings.
+//labels 是标签, 对应 influxdb 中的 tags, 即一组键值对.
+//
+//在 promethues/tsdb 中, timestamp 和 value 之外的所有信息都放在 labels 中
+//
+//这个 pkg 的核心就是 Label, Labels, 以及 Labels 的 Matcher
+
 type Label struct {
 	Name, Value string
 }
@@ -169,6 +175,7 @@ func Compare(a, b Labels) int {
 		l = len(b)
 	}
 
+	// 逐个 label 比较 name, value 的字母序
 	for i := 0; i < l; i++ {
 		if d := strings.Compare(a[i].Name, b[i].Name); d != 0 {
 			return d
@@ -178,6 +185,7 @@ func Compare(a, b Labels) int {
 		}
 	}
 	// If all labels so far were in common, the set with fewer labels comes first.
+	// 可比较的部分无法确定顺序, 则比较两者长度
 	return len(a) - len(b)
 }
 

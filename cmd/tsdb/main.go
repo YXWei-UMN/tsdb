@@ -176,8 +176,9 @@ func (b *writeBenchmark) run() error {
 	l := log.With(b.logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
 
 	st, err := tsdb.Open(dir, l, nil, &tsdb.Options{
-		RetentionDuration: 15 * 24 * 60 * 60 * 1000, // 15 days in milliseconds
-		BlockRanges:       tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 3),
+		RetentionDuration: 32 * 60 * 60 * 1000, // 32 hrs in milliseconds
+		// time range of a block expands from 2hrs -> 4 hrs -> 8 hrs -> 16 hrs -> 32 hrs
+		BlockRanges: tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 2), // from stepsize 3 -> 2
 	})
 	if err != nil {
 		return err
@@ -193,6 +194,7 @@ func (b *writeBenchmark) run() error {
 		}
 		defer f.Close()
 
+		//read data samples to form labels
 		labels, err = readPrometheusLabels(f, b.numMetrics)
 		if err != nil {
 			return err
@@ -207,7 +209,7 @@ func (b *writeBenchmark) run() error {
 
 	dur, err := measureTime("ingestScrapes", func() error {
 		b.startProfiling()
-		total, err = b.ingestScrapes(labels, 3000)
+		total, err = b.ingestScrapes(labels, 30000) // 10s sampling interval, 通过改变 scrape count 来 增大采样时间
 		if err != nil {
 			return err
 		}
@@ -235,15 +237,31 @@ func (b *writeBenchmark) run() error {
 	return nil
 }
 
-const timeDelta = 30000
+// 单位是millisecond
+const timeDelta = 1e4
 
 func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (uint64, error) {
 	var mu sync.Mutex
 	var total uint64
 
+	batchDuration, err := os.Create(filepath.Join(b.outPath, "batch.duration"))
+	if err != nil {
+		fmt.Println(" err", err)
+	}
+	defer batchDuration.Close()
+
+	//写入文件时，使用带缓存的 *Writer
+	write := bufio.NewWriter(batchDuration)
+	ticker := time.NewTicker(time.Second * 10) // 每秒tick一次, ticker 似乎比timer 更精准  但都不是按秒准确计时的 Chanel的读取有波动
+	var total_in_last_tick uint64
+	total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
+	last_time := time.Now()
+
 	for i := 0; i < scrapeCount; i += 100 {
 		var wg sync.WaitGroup
 		lbls := lbls
+		//每次插入1000 ts 的 100 samples  （每个sample 一个周期， 1000 ts的 1000sample 为一个batch， 每个go func 执行100个batch）
+		// 直接记录每1000*100 个sample的执行时间？ 不行 因为每1000*100的sample插入是高并发的 所以还是需要在外面每隔period of time 来overall的计算throughput
 		for len(lbls) > 0 {
 			l := 1000
 			if len(lbls) < 1000 {
@@ -251,10 +269,15 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 			}
 			batch := lbls[:l]
 			lbls = lbls[l:]
-
 			wg.Add(1)
 			go func() {
+				//打印每个batch的插入时间，不管这个batch是插入到内存还是flush到disk，latency都会受compaction影响
+				//start := time.Now()
 				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
+				//duration := int64(time.Since(start) / 1e6)
+				//s_duration := strconv.FormatInt(duration, 10)
+				//write.WriteString(s_duration + "\n")
+
 				if err != nil {
 					// exitWithError(err)
 					fmt.Println(" err", err)
@@ -266,12 +289,32 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 			}()
 		}
 		wg.Wait()
+
+		select {
+		case t := <-ticker.C:
+			duration := uint64(time.Since(last_time) / 1e9)
+			new_insert_sample_num := total - total_in_last_tick
+			throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
+
+			//格式化写入
+			s_throughput := strconv.FormatUint(throughput, 10)
+			write.WriteString(s_throughput + "\n")
+
+			//更新last time 和 last total
+			last_time = t
+			total_in_last_tick = total
+		default:
+		}
+
+		//Flush将缓存的文件真正写入到文件中
+		write.Flush()
 	}
 	fmt.Println("ingestion completed")
 
 	return total, nil
 }
 
+// 每次 1000 个 time series (i.e., labels) * 1 sample/label 插入到appender成为一个batch 并提交。 如此重复 scrape count 次数
 func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount int, baset int64) (uint64, error) {
 	ts := baset
 
@@ -298,7 +341,9 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 		for _, s := range scrape {
 			s.value += 1000
 
+			//往 appender里 加一个sample <labels, timestamp, value>
 			if s.ref == nil {
+				//该time series 已经存在
 				ref, err := app.Add(s.labels, ts, float64(s.value))
 				if err != nil {
 					panic(err)
@@ -316,9 +361,13 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 				}
 				s.ref = &ref
 			}
-
+			//又插入了一个samples
 			total++
 		}
+		// 注意在Add的时候其实只是插入到appender的一个临时空间 还没有显示到memseries里
+		// 因为理论上需要先commit到WAL 才可以显示在memseries里，可能为了性能， 每次batch一定量的（scrape count）的samples 再一次commit到WAL
+		//为什么增加scrape count 会 out of bound？  猜测可能是appender的临时空间不够了或者out of order 或者超越time range了？ 总之现在不需要增加每个batch 的 scrape count
+
 		if err := app.Commit(); err != nil {
 			return total, err
 		}
@@ -418,12 +467,13 @@ func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
 
 		labelChunks := strings.Split(s, ",")
 		for _, labelChunk := range labelChunks {
-			split := strings.Split(labelChunk, ":")
+			split := strings.Split(labelChunk, "=")
 			m = append(m, labels.Label{Name: split[0], Value: split[1]})
 		}
 		// Order of the k/v labels matters, don't assume we'll always receive them already sorted.
 		sort.Sort(m)
 		h := m.Hash()
+		// 如果已经读入了该time series （i.e., labels）就跳过
 		if _, ok := hashes[h]; ok {
 			continue
 		}

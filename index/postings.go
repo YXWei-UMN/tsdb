@@ -37,8 +37,9 @@ func AllPostingsKey() (name, value string) {
 // unordered batch fills on startup.
 type MemPostings struct {
 	mtx     sync.RWMutex
-	m       map[string]map[string][]uint64
-	ordered bool
+	m       map[string]map[string][]uint64 // label name -> label value -> array of series ID that has corresponding label set
+	ordered bool                           //如果每个label pair包含的series足够多，那么对多个label pair的series做交集也将是非常耗时的操作。
+	// 那么能不能进一步优化呢？事实上，只要保持每个label pair里包含的series有序就可以了，这样就能将复杂度从指数级瞬间下降到线性级
 }
 
 // NewMemPostings returns a memPostings that's ready for reads and writes.
@@ -213,15 +214,17 @@ func (p *MemPostings) Iter(f func(labels.Label, Postings) error) error {
 // Add a label set to the postings index.
 func (p *MemPostings) Add(id uint64, lset labels.Labels) {
 	p.mtx.Lock()
-
+	// 将新创建的memSeries refId都加到对应的Label倒排里去， prometheous assume real world data set 不超过 5k labels
 	for _, l := range lset {
 		p.addFor(id, l)
 	}
-	p.addFor(id, allPostingsKey)
+	p.addFor(id, allPostingsKey) // allPostingKey "","" every one都加进去
 
 	p.mtx.Unlock()
 }
 
+// 假设prometheus抓取到一个新的series
+// 在初始化memSeries后，更新哈希表后，还需要对倒排索引进行更新
 func (p *MemPostings) addFor(id uint64, l labels.Label) {
 	nm, ok := p.m[l.Name]
 	if !ok {

@@ -514,6 +514,7 @@ type instrumentedChunkWriter struct {
 
 func (w *instrumentedChunkWriter) WriteChunks(chunks ...chunks.Meta) error {
 	for _, c := range chunks {
+		//似乎是 chunk的大小 sample数目 时间都可以作为boundary
 		w.size.Observe(float64(len(c.Chunk.Bytes())))
 		w.samples.Observe(float64(c.Chunk.NumSamples()))
 		w.trange.Observe(float64(c.MaxTime - c.MinTime))
@@ -663,6 +664,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	c.metrics.populatingBlocks.Set(1)
 
 	globalMaxt := blocks[0].Meta().MaxTime
+	// 遍历旧 block 数据
 	for i, b := range blocks {
 		select {
 		case <-c.ctx.Done():
@@ -719,6 +721,8 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			set = s
 			continue
 		}
+
+		// 与上一层并形成一个新的 merger
 		set, err = newCompactionMerger(set, s)
 		if err != nil {
 			return err
@@ -737,6 +741,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	}
 
 	delIter := &deletedIterator{}
+	// 遍历 merger
 	for set.Next() {
 		select {
 		case <-c.ctx.Done():

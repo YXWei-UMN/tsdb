@@ -11,12 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-TSDB_PROJECT_DIR = "."
+TSDB_PROJECT_DIR := $(shell pwd)
 TSDB_CLI_DIR="$(TSDB_PROJECT_DIR)/cmd/tsdb"
 TSDB_BIN = "$(TSDB_CLI_DIR)/tsdb"
-TSDB_BENCHMARK_NUM_METRICS ?= 1000
-TSDB_BENCHMARK_DATASET ?= "$(TSDB_PROJECT_DIR)/testdata/20kseries.json"
-TSDB_BENCHMARK_OUTPUT_DIR ?= "$(TSDB_CLI_DIR)/benchout"
+TSDB_BENCHMARK_NUM_METRICS ?= 100000
+TSDB_BENCHMARK_DATASET ?= "$(TSDB_PROJECT_DIR)/testdata/ts-1M/devops0.9M-1"
+TSDB_BENCHMARK_OUTPUT_DIR ?= "$(TSDB_PROJECT_DIR)/benchout"
 
 include Makefile.common
 

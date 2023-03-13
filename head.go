@@ -58,13 +58,14 @@ var (
 )
 
 // Head handles reads and writes of time series data within a time window.
+// 可以认为是current Block
 type Head struct {
 	chunkRange int64
 	metrics    *headMetrics
 	wal        *wal.WAL
 	logger     log.Logger
-	appendPool sync.Pool
-	bytesPool  sync.Pool
+	appendPool sync.Pool // 由于 golang 内建的 GC 机制会影响应用的性能，为了减少 GC，golang 提供了对象重用的机制，也就是 sync.Pool 对象池。
+	bytesPool  sync.Pool // sync.Pool 是可伸缩的，并发安全的。其大小仅受限于内存的大小，可以被看作是一个存放可重用对象的值的容器。 设计的目的是存放已经分配的但是暂时不用的对象，在需要用到的时候直接从 pool 中取。
 	numSeries  uint64
 
 	minTime, maxTime int64 // Current min and max of the samples included in the head.
@@ -629,10 +630,12 @@ func (h *Head) Truncate(mint int64) (err error) {
 		return ok
 	}
 	h.metrics.checkpointCreationTotal.Inc()
+	// 生成新的checkpoint
 	if _, err = Checkpoint(h.wal, first, last, keep, mint); err != nil {
 		h.metrics.checkpointCreationFail.Inc()
 		return errors.Wrap(err, "create checkpoint")
 	}
+	// 将segment.n之前的segment删掉
 	if err := h.wal.Truncate(last + 1); err != nil {
 		// If truncating fails, we'll just try again at the next checkpoint.
 		// Leftover segments will just be ignored in the future if there's a checkpoint
@@ -651,6 +654,7 @@ func (h *Head) Truncate(mint int64) (err error) {
 	h.deletedMtx.Unlock()
 
 	h.metrics.checkpointDeleteTotal.Inc()
+	// 将之前的checkpoint删掉: < last
 	if err := DeleteCheckpoints(h.wal.Dir(), last); err != nil {
 		// Leftover old checkpoints do not cause problems down the line beyond
 		// occupying disk space.
@@ -759,6 +763,10 @@ func (a *initAppender) Rollback() error {
 }
 
 // Appender returns a new Appender on the database.
+// 会根据具体情形决定返回的 Appender 实例
+// Appender 实例共两类
+// initAppender 会在接收到第一个数据点时初始化 Head 的起始时间
+// headAppender 逻辑相对简单
 func (h *Head) Appender() Appender {
 	h.metrics.activeAppenders.Inc()
 
@@ -824,6 +832,7 @@ type headAppender struct {
 	samples []RefSample
 }
 
+// calling example  app.Add(s.labels, ts, float64(s.value))
 func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, error) {
 	if t < a.minValidTime {
 		return 0, ErrOutOfBounds
@@ -832,13 +841,15 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 	// Ensure no empty labels have gotten through.
 	lset = lset.WithoutEmpty()
 
+	// 如果lset对应的series没有，则建一个。创建的过程包含了seriesHashMap/Postings(倒排索引)/LabelIndex的维护
 	s, created := a.head.getOrCreate(lset.Hash(), lset)
-	if created {
+	if created { // 如果新创建了一个，则将新建的也放到a.series里面
 		a.series = append(a.series, RefSeries{
 			Ref:    s.ref,
 			Labels: lset,
 		})
 	}
+	//似乎真正的插入還是 AddFast
 	return s.ref, a.AddFast(s.ref, t, v)
 }
 
@@ -846,7 +857,7 @@ func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 	if t < a.minValidTime {
 		return ErrOutOfBounds
 	}
-
+	// 拿出对应的memSeries
 	s := a.head.series.getByID(ref)
 	if s == nil {
 		return errors.Wrap(ErrNotFound, "unknown series")
@@ -856,6 +867,7 @@ func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 		s.Unlock()
 		return err
 	}
+	// 设置为等待提交状态，表示该series存在sample等待写到WAL
 	s.pendingCommit = true
 	s.Unlock()
 
@@ -865,7 +877,13 @@ func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 	if t > a.maxt {
 		a.maxt = t
 	}
+	// 为了事务概念，放入temp存储，等待真正commit时候再写入memSeries
 
+	// Prometheus在add数据点的时候并没有直接add到memSeries(也就是query所用到的结构体里),而是加入到一个临时的samples切片里面。
+	// 同时还将这个数据点对应的memSeries同步增加到另一个sampleSeries里面
+
+	// 为什么要这么做呢？就是为了实现commit语义，只有commit过后数据才可见(能被查询到)。否则，无法见到这些数据。
+	// 而commit的动作主要就是WAL(Write Ahead Log)以及将headerAppender.samples数据写到其对应的memSeries中。这样，查询就可见这些数据了，
 	a.samples = append(a.samples, RefSample{
 		Ref:    ref,
 		T:      t,
@@ -875,6 +893,7 @@ func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 	return nil
 }
 
+// 由于Prometheus最近的数据是保存在内存里面的，防止服务器宕机丢失数据。其在commit之前先写了日志WAL。等服务重启的时候，再从WAL日志里面获取信息并重放
 func (a *headAppender) log() error {
 	if a.head.wal == nil {
 		return nil
@@ -889,15 +908,16 @@ func (a *headAppender) log() error {
 	if len(a.series) > 0 {
 		rec = enc.Series(a.series, buf)
 		buf = rec[:0]
-
+		//这里log head.appender里的所有buffer的series
 		if err := a.head.wal.Log(rec); err != nil {
 			return errors.Wrap(err, "log series")
 		}
 	}
 	if len(a.samples) > 0 {
+		//remember 之前写入的data point都被buffer在 head.samples里等待最后commit -> log
 		rec = enc.Samples(a.samples, buf)
 		buf = rec[:0]
-
+		// 这里log 所有buffer的samples (不只是一个series的sample)
 		if err := a.head.wal.Log(rec); err != nil {
 			return errors.Wrap(err, "log samples")
 		}
@@ -916,9 +936,10 @@ func (a *headAppender) Commit() error {
 	total := len(a.samples)
 
 	for _, s := range a.samples {
-		s.series.Lock()
+		s.series.Lock() //每一个sample有对应memseries的指针
+		//为什么log有写 这里还再写一次？ 这里是headerAppender.samples数据写到其对应的memSeries中
 		ok, chunkCreated := s.series.append(s.T, s.V)
-		s.series.pendingCommit = false
+		s.series.pendingCommit = false //TODO 这里似乎是有个问题的 每次batch了 1000个series的各100个samples，理应等100samples写完再把对应series的pending解除
 		s.series.Unlock()
 
 		if !ok {
@@ -1289,6 +1310,7 @@ func (h *headIndexReader) LabelNames() ([]string, error) {
 	return labelNames, nil
 }
 
+// 大概是返回一个iterator 帮助遍历带有这个label pair的所有memseries
 // Postings returns the postings list iterator for the label pair.
 func (h *headIndexReader) Postings(name, value string) (index.Postings, error) {
 	return h.head.postings.Get(name, value), nil
@@ -1383,9 +1405,12 @@ func (h *Head) getOrCreate(hash uint64, lset labels.Labels) (*memSeries, bool) {
 	return h.getOrCreateWithID(id, hash, lset)
 }
 
+// 假设prometheus抓取到一个新的series node_cpu_seconds_total{mode="user",cpu="0",instance="1.1.1.1:9100"} 他的ref为x
+// 在初始化memSeries后，更新哈希表后，还需要对倒排索引进行更新
 func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSeries, bool) {
 	s := newMemSeries(lset, id, h.chunkRange)
 
+	// 更新两个哈希表后  hashs  &  series
 	s, created := h.series.getOrSet(hash, s)
 	if !created {
 		return s, false
@@ -1393,7 +1418,7 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 
 	h.metrics.seriesCreated.Inc()
 	atomic.AddUint64(&h.numSeries, 1)
-
+	// 也插入<lable,id> 到Postings中
 	h.postings.Add(id, lset)
 
 	h.symMtx.Lock()
@@ -1405,8 +1430,9 @@ func (h *Head) getOrCreateWithID(id, hash uint64, lset labels.Labels) (*memSerie
 			valset = stringset{}
 			h.values[l.Name] = valset
 		}
+		// 将可能取值塞入stringset中
 		valset.set(l.Value)
-
+		// 符号表的维护
 		h.symbols[l.Name] = struct{}{}
 		h.symbols[l.Value] = struct{}{}
 	}
@@ -1454,14 +1480,18 @@ func (m seriesHashmap) del(hash uint64, lset labels.Labels) {
 	}
 }
 
+// 如何通过一堆标签快速找到对应的 memSeries。自然的，Prometheus 就采用了 hash。主要结构体为:
 // stripeSeries locks modulo ranges of IDs and hashes to reduce lock contention.
 // The locks are padded to not be on the same cache line. Filling the padded space
 // with the maps was profiled to be slower – likely due to the additional pointer
 // dereferences.
 type stripeSeries struct {
-	series [stripeSize]map[uint64]*memSeries
-	hashes [stripeSize]seriesHashmap
-	locks  [stripeSize]stripeLock
+	series [stripeSize]map[uint64]*memSeries // 记录refId到memSeries的映射
+	hashes [stripeSize]seriesHashmap         // 本质是 seriesHashmap = [uint64][]*memSeries。  记录label的hash值到memSeries （可多个）,hash冲突采用拉链法
+	locks  [stripeSize]stripeLock            // 分段锁. 由于 golang 的 map 非线程安全，所以其采用了分段锁去拆分锁
+	//Prometheus将一整个大的哈希表进行了切片，切割成了stripeSize （16k）个小的哈希表。
+	//如果想要利用ref找到对应的series，首先要将ref对16K取模，假设得到的值为x，找到对应的小哈希表series[x]。
+	//至于对小哈希表的操作，只需要锁住模对应的locks[x]，从而大大减小了读写memSeries时对锁的抢占造成的损耗，提高了并发性能。对于基于label哈希值的读写，操作类似。
 }
 
 const (
@@ -1502,7 +1532,7 @@ func (s *stripeSeries) gc(mint int64) (map[uint64]struct{}, int) {
 		for hash, all := range s.hashes[i] {
 			for _, series := range all {
 				series.Lock()
-				rmChunks += series.truncateChunksBefore(mint)
+				rmChunks += series.truncateChunksBefore(mint) //return K 表示从第K个chunk开始没有被remove
 
 				if len(series.chunks) > 0 || series.pendingCommit {
 					series.Unlock()
@@ -1597,10 +1627,10 @@ func (s sample) V() float64 {
 type memSeries struct {
 	sync.Mutex
 
-	ref          uint64
-	lset         labels.Labels
-	chunks       []*memChunk
-	headChunk    *memChunk
+	ref          uint64        // 其id
+	lset         labels.Labels // 对应的TS的label集合
+	chunks       []*memChunk   // 数据集合
+	headChunk    *memChunk     // 正在被写入的chunk
 	chunkRange   int64
 	firstChunkID int
 
@@ -1636,8 +1666,9 @@ func (s *memSeries) maxTime() int64 {
 	return c.maxTime
 }
 
+// 新创建（cut）一个head chunk
 func (s *memSeries) cut(mint int64) *memChunk {
-	c := &memChunk{
+	c := &memChunk{ //memChunk是对chunk的in memory版本的包装 本质是chunk  目前实现了XORChunk
 		chunk:   chunkenc.NewXORChunk(),
 		minTime: mint,
 		maxTime: math.MinInt64,
@@ -1653,6 +1684,7 @@ func (s *memSeries) cut(mint int64) *memChunk {
 	if err != nil {
 		panic(err)
 	}
+	//该memseries的appender是headchunk的appender
 	s.app = app
 	return c
 }
@@ -1698,8 +1730,10 @@ func (s *memSeries) appendable(t int64, v float64) error {
 	return nil
 }
 
+// 根据 id，找到想查找的 chunk 在内存映射中的索引，从而找到该 chunk
 func (s *memSeries) chunk(id int) *memChunk {
-	ix := id - s.firstChunkID
+	ix := id - s.firstChunkID //ix 表示 chunk 在 Chunks 的索引，chunkID 是从1递增的, firstChunkID表示在该memseries里的第一块chunk的ID， 其并不总是1 也可能是之前的chunks flush下去后的+1。
+	// Hence，（id- s.firstChunkID）就是这个 chunk 在 Chunks 的索引
 	if ix < 0 || ix >= len(s.chunks) {
 		return nil
 	}
@@ -1738,32 +1772,33 @@ func (s *memSeries) append(t int64, v float64) (success, chunkCreated bool) {
 	// the time range within which we have to decompress all samples.
 	const samplesPerChunk = 120
 
-	c := s.head()
+	c := s.head() //获得该series的head chunk
 
 	if c == nil {
-		c = s.cut(t)
+		c = s.cut(t) // 如果没有head chunk， 创建一个， 该chunk的Mint是当前append的sample的T， 该memseries的appender是headchunk的appender
 		chunkCreated = true
 	}
 	numSamples := c.chunk.NumSamples()
 
-	// Out of order sample.
+	// Out of order sample. maxTime应该是最近插入的sample的T，所以应当一直小于新插入的sample才是in order
 	if c.maxTime >= t {
 		return false, chunkCreated
 	}
 	// If we reach 25% of a chunk's desired sample count, set a definitive time
 	// at which to start the next chunk.
-	// At latest it must happen at the timestamp set when the chunk was cut.
+	// At least it must happen at the timestamp set when the chunk was cut.
 	if numSamples == samplesPerChunk/4 {
 		s.nextAt = computeChunkEndTime(c.minTime, c.maxTime, s.nextAt)
 	}
 	if t >= s.nextAt {
-		c = s.cut(t)
+		c = s.cut(t) //如果到了这个chunk的时间上限，cut一个新的
 		chunkCreated = true
 	}
-	s.app.Append(t, v)
+	s.app.Append(t, v) //似乎是调用chunk的appender去append到chunk里
 
 	c.maxTime = t
 
+	//好像是保留最近的四个 因为其压缩值会受新add的sample影响？
 	s.sampleBuf[0] = s.sampleBuf[1]
 	s.sampleBuf[1] = s.sampleBuf[2]
 	s.sampleBuf[2] = s.sampleBuf[3]

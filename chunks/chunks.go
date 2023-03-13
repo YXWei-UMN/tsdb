@@ -93,13 +93,21 @@ func newCRC32() hash.Hash32 {
 // Writer implements the ChunkWriter interface for the standard
 // serialization format.
 type Writer struct {
+	// 当前目录
 	dirFile *os.File
-	files   []*os.File
-	wbuf    *bufio.Writer
-	n       int64
-	crc32   hash.Hash
-	buf     [binary.MaxVarintLen32]byte
 
+	// 所有用于写入的数据文件, 只有最后一个是当前有效的
+	files []*os.File
+	wbuf  *bufio.Writer
+
+	// 当前分片文件已写入的字节数
+	n int64
+
+	// 复用的 crc32, 用于每一个写入的 Chunk 的校验
+	crc32 hash.Hash
+	buf   [binary.MaxVarintLen32]byte
+
+	// 分片的尺寸, 目前是 512 << 20
 	segmentSize int64
 }
 
@@ -132,6 +140,7 @@ func (w *Writer) tail() *os.File {
 	return w.files[len(w.files)-1]
 }
 
+// 安全地关闭当前用于写入的文件
 // finalizeTail writes all pending data to the current tail file,
 // truncates its size, and closes it.
 func (w *Writer) finalizeTail() error {
@@ -147,6 +156,7 @@ func (w *Writer) finalizeTail() error {
 		return err
 	}
 	// As the file was pre-allocated, we truncate any superfluous zero bytes.
+	// 由于每个 seq file 都会预先分配空间, 因此需要按照实际使用量进行一次 Truncate
 	off, err := tf.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -164,6 +174,7 @@ func (w *Writer) cut() error {
 		return err
 	}
 
+	// 打开一个新文件用于数据写入
 	p, _, err := nextSequenceFile(w.dirFile.Name())
 	if err != nil {
 		return err
@@ -172,6 +183,8 @@ func (w *Writer) cut() error {
 	if err != nil {
 		return err
 	}
+
+	// 为文件预分配 segmentSize 大小
 	if err = fileutil.Preallocate(f, w.segmentSize, true); err != nil {
 		return err
 	}
@@ -188,12 +201,16 @@ func (w *Writer) cut() error {
 		return err
 	}
 
+	// 重置或初始化一个 bufio.Writer
 	w.files = append(w.files, f)
 	if w.wbuf != nil {
 		w.wbuf.Reset(f)
 	} else {
 		w.wbuf = bufio.NewWriterSize(f, 8*1024*1024)
 	}
+
+	// 重置已写入的字节数, 8 是 文件头 MagicChunks 占用的大小
+	// 即前面 `Write header metadata for new file.` 的 b 部分
 	w.n = 8
 
 	return nil
@@ -287,6 +304,7 @@ func MergeChunks(a, b chunkenc.Chunk) (*chunkenc.XORChunk, error) {
 func (w *Writer) WriteChunks(chks ...Meta) error {
 	// Calculate maximum space we need and cut a new segment in case
 	// we don't fit into the current one.
+	// 计算所有 chunks 可能占用的空间
 	maxLen := int64(binary.MaxVarintLen32) // The number of chunks.
 	for _, c := range chks {
 		maxLen += binary.MaxVarintLen32 + 1 // The number of bytes in the chunk and its encoding.
@@ -295,6 +313,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 	}
 	newsz := w.n + maxLen
 
+	// 根据这里执行 w.cut() 的判断条件, 实际上是可能出现单个文件超过 w.segmentSize 的  (not sure, has changed)
 	if w.wbuf == nil || newsz > w.segmentSize && maxLen <= w.segmentSize {
 		if err := w.cut(); err != nil {
 			return err
@@ -305,6 +324,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 	for i := range chks {
 		chk := &chks[i]
 
+		// 用于定位 Chunk
 		chk.Ref = seq | uint64(w.n)
 
 		n := binary.PutUvarint(w.buf[:], uint64(len(chk.Chunk.Bytes())))
@@ -320,6 +340,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 			return err
 		}
 
+		// 校验数据
 		w.crc32.Reset()
 		if err := chk.writeHash(w.crc32, w.buf[:]); err != nil {
 			return err
@@ -345,7 +366,7 @@ func (w *Writer) Close() error {
 	return w.dirFile.Close()
 }
 
-// ByteSlice abstracts a byte slice.
+// ByteSlice abstracts a byte slice. 用于 Reader 中逐段读取数据
 type ByteSlice interface {
 	Len() int
 	Range(start, end int) []byte
@@ -399,11 +420,17 @@ func newReader(bs []ByteSlice, cs []io.Closer, pool chunkenc.Pool) (*Reader, err
 
 // NewDirReader returns a new Reader against sequentially numbered files in the
 // given directory.
+// 由于chunks文件大小基本固定(最大512M),所以我们很容易的可以通过mmap去访问对应的数据。直接将对应文件的读操作交给操作系统，既省心又省力
+// Dir 指的是一个block 在storage上以dir形式存储一系列chunks  （但注意 文件00000x 可以包含多个chunk）
+// mmap之后的访问由 1） ref（chunk0x）>> 32 算出文件名   2）（ref(chunk0x)<<32）>>32 算出offset
 func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
+	// 根据命名规则得到所有数据文件
 	files, err := sequenceFiles(dir)
 	if err != nil {
 		return nil, err
 	}
+
+	// 初始化一个 chunkenc.Pool
 	if pool == nil {
 		pool = chunkenc.NewPool()
 	}
@@ -414,14 +441,14 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 		merr tsdb_errors.MultiError
 	)
 	for _, fn := range files {
-		f, err := fileutil.OpenMmapFile(fn)
+		f, err := fileutil.OpenMmapFile(fn) // 通过mmap访问
 		if err != nil {
 			merr.Add(errors.Wrap(err, "mmap files"))
 			merr.Add(closeAll(cs))
 			return nil, merr
 		}
 		cs = append(cs, f)
-		bs = append(bs, realByteSlice(f.Bytes()))
+		bs = append(bs, realByteSlice(f.Bytes())) //通过sgmBytes := s.bs[offset]就直接能获取对应的数据
 	}
 
 	reader, err := newReader(bs, cs, pool)
@@ -443,7 +470,9 @@ func (s *Reader) Size() int64 {
 }
 
 // Chunk returns a chunk from a given reference.
+// 根据定位读取指定 Chunk
 func (s *Reader) Chunk(ref uint64) (chunkenc.Chunk, error) {
+	// 分别计算文件所在的位置, 和 Chunk 数据的起始位置
 	var (
 		sgmSeq    = int(ref >> 32)
 		sgmOffset = int((ref << 32) >> 32)
@@ -466,6 +495,7 @@ func (s *Reader) Chunk(ref uint64) (chunkenc.Chunk, error) {
 	}
 	chk = chkS.Range(sgmOffset+n, sgmOffset+n+1+int(chkLen))
 
+	// 将数据封装成一个 chunkenc.Chunk
 	return s.pool.Get(chunkenc.Encoding(chk[0]), chk[1:1+chkLen])
 }
 

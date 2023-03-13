@@ -51,8 +51,8 @@ var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // A flush is triggered when a single records doesn't fit the page size or
 // when the next record can't fit in the remaining free page space.
 type page struct {
-	alloc   int
-	flushed int
+	alloc   int //表示flush到该page的哪一部分   alloc=pageSize 表示flush till the end of the page
+	flushed int //已经flush的offset  Write(p.buf[p.flushed:p.alloc])   这俩offset会在clear page后清零
 	buf     [pageSize]byte
 }
 
@@ -435,17 +435,20 @@ func (w *WAL) nextSegment() error {
 			return err
 		}
 	}
+	//一个segment是一个WAL file，128 MB. Create Segment 就是创建一个新的WAL file
 	next, err := CreateSegment(w.dir, w.segment.Index()+1)
 	if err != nil {
 		return errors.Wrap(err, "create new segment file")
 	}
 	prev := w.segment
+	//将当前segment设置为这个新的next segment
 	if err := w.setSegment(next); err != nil {
 		return err
 	}
 
 	// Don't block further writes by fsyncing the last segment.
 	w.actorc <- func() {
+		// fsync会将OS cache里的data 直接flush到disk 保证persistency
 		if err := w.fsync(prev); err != nil {
 			level.Error(w.logger).Log("msg", "sync previous segment", "err", err)
 		}
@@ -483,6 +486,7 @@ func (w *WAL) flushPage(clear bool) error {
 	if clear {
 		p.alloc = pageSize // Write till end of page.
 	}
+	//本质上是File package里的write
 	n, err := w.segment.Write(p.buf[p.flushed:p.alloc])
 	if err != nil {
 		return err
@@ -552,6 +556,7 @@ func (w *WAL) Log(recs ...[]byte) error {
 	// Callers could just implement their own list record format but adding
 	// a bit of extra logic here frees them from that overhead.
 	for i, r := range recs {
+		// 如果 i = recs这个batch的最后一个 log函数会flush page. page = active page = 唯一的reused的in memory buffer for WAL disk write
 		if err := w.log(r, i == len(recs)-1); err != nil {
 			return err
 		}
@@ -687,6 +692,7 @@ func (w *WAL) Truncate(i int) (err error) {
 
 func (w *WAL) fsync(f *Segment) error {
 	start := time.Now()
+	//TODO 如果要bypass FS 直接用ZNS SSD 可能这些用到File package的函数都需要替换
 	err := f.File.Sync()
 	w.fsyncDuration.Observe(time.Since(start).Seconds())
 	return err

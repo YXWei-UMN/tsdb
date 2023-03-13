@@ -90,6 +90,7 @@ type Options struct {
 // call to Commit or Rollback and must not be reused afterwards.
 //
 // Operations on the Appender interface are not goroutine-safe.
+// Appender 是写入接口, *Head 就实现了 Appender
 type Appender interface {
 	// Add adds a sample pair for the given series. A reference number is
 	// returned which can be used to add further samples in the same or later
@@ -97,7 +98,7 @@ type Appender interface {
 	// Returned reference numbers are ephemeral and may be rejected in calls
 	// to AddFast() at any point. Adding the sample via Add() returns a new
 	// reference number.
-	// If the reference is 0 it must not be used for caching.
+	// If the reference is 0 it must not be used for cachinxg.
 	Add(l labels.Labels, t int64, v float64) (uint64, error)
 
 	// AddFast adds a sample pair for the referenced series. It is generally
@@ -484,6 +485,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		cancel()
 		return nil, errors.Wrap(err, "create leveled compactor")
 	}
+
 	db.compactCancel = cancel
 
 	var wlog *wal.WAL
@@ -508,8 +510,10 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	if err := db.reload(); err != nil {
 		return nil, err
 	}
+
 	// Set the min valid time for the ingested samples
 	// to be no lower than the maxt of the last block.
+	//blocks 是一堆persisted block的集合
 	blocks := db.Blocks()
 	minValidTime := int64(math.MinInt64)
 	if len(blocks) > 0 {
@@ -524,6 +528,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		}
 	}
 
+	//TODO run 方法在 Open 时被调用, 在一个单独的 goroutine 中执行, 主要是定期对数据进行compaction
 	go db.run()
 
 	return db, nil
@@ -534,6 +539,7 @@ func (db *DB) Dir() string {
 	return db.dir
 }
 
+// run 方法在 Open 时被调用, 在一个单独的 goroutine 中执行, 主要是定期对数据进行压缩以节省空间
 func (db *DB) run() {
 	defer close(db.donec)
 
@@ -543,25 +549,25 @@ func (db *DB) run() {
 		select {
 		case <-db.stopc:
 			return
-		case <-time.After(backoff):
+		case <-time.After(backoff): //因为没有default 所以大部分时间都空转backoff time的时间 然后跑去看看是否可以compaction
 		}
 
 		select {
 		case <-time.After(1 * time.Minute):
+			println("check every 1 min in run function")
 			select {
-			case db.compactc <- struct{}{}:
+			case db.compactc <- struct{}{}: //每1min 检查一下是否compaction, 但其实在batch write里 每次写了一个batch的data 都会检查是否compactable，如果是就db.compactc <- struct{}{}， 所以频率会高于1min
 			default:
 			}
 		case <-db.compactc:
 			db.metrics.compactionsTriggered.Inc()
-
 			db.autoCompactMtx.Lock()
 			if db.autoCompact {
 				if err := db.compact(); err != nil {
 					level.Error(db.logger).Log("msg", "compaction failed", "err", err)
-					backoff = exponential(backoff, 1*time.Second, 1*time.Minute)
+					backoff = exponential(backoff, 1*time.Second, 1*time.Minute) //如果compaction 失败， double backoff time，在下一个for循环多等待一会
 				} else {
-					backoff = 0
+					backoff = 0 //成功compact了 backoff就归零？ 因为后端压力小？
 				}
 			} else {
 				db.metrics.compactionsSkipped.Inc()
@@ -581,8 +587,8 @@ func (db *DB) Appender() Appender {
 // dbAppender wraps the DB's head appender and triggers compactions on commit
 // if necessary.
 type dbAppender struct {
-	Appender
-	db *DB
+	Appender // 根据上面把dbAppender封装成db.Appender的函数可知，这里dbAppender里实际用的是db.head.Appender
+	db       *DB
 }
 
 func (a dbAppender) Commit() error {
@@ -591,10 +597,26 @@ func (a dbAppender) Commit() error {
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
 	if a.db.head.compactable() {
-		select {
+		/*select {
 		case a.db.compactc <- struct{}{}:
 		default:
+		}*/
+
+		a.db.metrics.compactionsTriggered.Inc()
+		//a.db.DisableCompactions()
+		//println("trigger flushing")
+		//string := fmt.Sprintf("head is compactable, current head max time=%s min time=%s chunk range=%s", a.db.head.maxTime, a.db.head.minTime, a.db.head.chunkRange)
+		//fmt.Println(string)
+		a.db.autoCompactMtx.Lock()
+		if a.db.autoCompact {
+			if err := a.db.compact(); err != nil {
+				level.Error(a.db.logger).Log("msg", "compaction failed", "err", err)
+			}
+		} else {
+			a.db.metrics.compactionsSkipped.Inc()
 		}
+		a.db.autoCompactMtx.Unlock()
+
 	}
 	return err
 }
@@ -622,7 +644,7 @@ func (db *DB) compact() (err error) {
 			return nil
 		default:
 		}
-		if !db.head.compactable() {
+		if !db.head.compactable() { //如果这个head的时间超过了既定range的3/2 就是compactable
 			break
 		}
 		mint := db.head.MinTime()
@@ -665,7 +687,7 @@ func (db *DB) compact() (err error) {
 	}
 
 	// Check for compactions of multiple blocks.
-	for {
+	/*for {
 		plan, err := db.compactor.Plan(db.dir)
 		if err != nil {
 			return errors.Wrap(err, "plan compaction")
@@ -693,7 +715,7 @@ func (db *DB) compact() (err error) {
 			return errors.Wrap(err, "reload blocks")
 		}
 		runtime.GC()
-	}
+	}*/
 
 	return nil
 }
@@ -1091,7 +1113,7 @@ func (db *DB) DisableCompactions() {
 	defer db.autoCompactMtx.Unlock()
 
 	db.autoCompact = false
-	level.Info(db.logger).Log("msg", "compactions disabled")
+	//level.Info(db.logger).Log("msg", "compactions disabled")
 }
 
 // EnableCompactions enables auto compactions.
@@ -1154,12 +1176,15 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	db.mtx.RLock()
 	defer db.mtx.RUnlock()
 
+	// 找出符合时间段的 block (not sure)
 	for _, b := range db.blocks {
 		if b.OverlapsClosedInterval(mint, maxt) {
 			blocks = append(blocks, b)
 			blockMetas = append(blockMetas, b.Meta())
 		}
 	}
+
+	// Head 可以视作当前 Block
 	if maxt >= db.head.MinTime() {
 		blocks = append(blocks, &rangeHead{
 			head: db.head,
@@ -1200,6 +1225,7 @@ func rangeForTimestamp(t int64, width int64) (maxt int64) {
 }
 
 // Delete implements deletion of metrics. It only has atomicity guarantees on a per-block basis.
+// 这边实际会将 Delete 操作分给各个受影响的 Block
 func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
