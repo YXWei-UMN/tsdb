@@ -95,10 +95,12 @@ type headMetrics struct {
 	chunksCreated           prometheus.Counter
 	chunksRemoved           prometheus.Counter
 	gcDuration              prometheus.Summary
+	gcduration              uint64
 	minTime                 prometheus.GaugeFunc
 	maxTime                 prometheus.GaugeFunc
 	samplesAppended         prometheus.Counter
 	walTruncateDuration     prometheus.Summary
+	WALcheckpoint_duration  uint64
 	walCorruptionsTotal     prometheus.Counter
 	headTruncateFail        prometheus.Counter
 	headTruncateTotal       prometheus.Counter
@@ -150,6 +152,8 @@ func newHeadMetrics(h *Head, r prometheus.Registerer) *headMetrics {
 		Help:       "Runtime of garbage collection in the head block.",
 		Objectives: map[float64]float64{},
 	})
+	m.gcduration = uint64(0)
+	m.WALcheckpoint_duration = uint64(0)
 	m.maxTime = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "prometheus_tsdb_head_max_time",
 		Help: "Maximum timestamp of the head block. The unit is decided by the library consumer.",
@@ -591,8 +595,10 @@ func (h *Head) Truncate(mint int64) (err error) {
 	start := time.Now()
 
 	h.gc()
-	level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
 	h.metrics.gcDuration.Observe(time.Since(start).Seconds())
+	h.metrics.gcduration = h.metrics.gcduration + uint64(time.Since(start)/1e6)
+	level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
+	println("total head GC duration (millisecond)", h.metrics.gcduration)
 
 	if h.wal == nil {
 		return nil
@@ -663,9 +669,12 @@ func (h *Head) Truncate(mint int64) (err error) {
 		h.metrics.checkpointDeleteFail.Inc()
 	}
 	h.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
+	h.metrics.WALcheckpoint_duration = h.metrics.WALcheckpoint_duration + uint64(time.Since(start)/1e6)
 
 	level.Info(h.logger).Log("msg", "WAL checkpoint complete",
 		"first", first, "last", last, "duration", time.Since(start))
+
+	println("total WAL checkpoint duration (millisecond)", h.metrics.WALcheckpoint_duration)
 
 	return nil
 }
@@ -835,7 +844,7 @@ type headAppender struct {
 // calling example  app.Add(s.labels, ts, float64(s.value))
 func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, error) {
 	if t < a.minValidTime {
-		return 0, ErrOutOfBounds
+		a.minValidTime = t
 	}
 
 	// Ensure no empty labels have gotten through.
@@ -855,7 +864,7 @@ func (a *headAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 
 func (a *headAppender) AddFast(ref uint64, t int64, v float64) error {
 	if t < a.minValidTime {
-		return ErrOutOfBounds
+		a.minValidTime = t
 	}
 	// 拿出对应的memSeries
 	s := a.head.series.getByID(ref)

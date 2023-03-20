@@ -82,18 +82,22 @@ type LeveledCompactor struct {
 }
 
 type compactorMetrics struct {
-	ran               prometheus.Counter
-	populatingBlocks  prometheus.Gauge
-	overlappingBlocks prometheus.Counter
-	duration          prometheus.Histogram
-	chunkSize         prometheus.Histogram
-	chunkSamples      prometheus.Histogram
-	chunkRange        prometheus.Histogram
+	ran                    prometheus.Counter
+	populatingBlocks       prometheus.Gauge
+	overlappingBlocks      prometheus.Counter
+	duration               prometheus.Histogram
+	write_block_duration   uint64
+	compact_block_duration uint64
+	chunkSize              prometheus.Histogram
+	chunkSamples           prometheus.Histogram
+	chunkRange             prometheus.Histogram
 }
 
 func newCompactorMetrics(r prometheus.Registerer) *compactorMetrics {
 	m := &compactorMetrics{}
 
+	m.write_block_duration = uint64(0)
+	m.compact_block_duration = uint64(0)
 	m.ran = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "prometheus_tsdb_compactions_total",
 		Help: "Total number of compactions that were executed for the partition.",
@@ -447,6 +451,9 @@ func (c *LeveledCompactor) Compact(dest string, dirs []string, open []*Block) (u
 				"duration", time.Since(start),
 			)
 		}
+
+		c.metrics.compact_block_duration = c.metrics.compact_block_duration + uint64(time.Since(start)/1e6)
+		println("total compaction duration (millisecond)", c.metrics.compact_block_duration)
 		return uid, nil
 	}
 
@@ -499,6 +506,10 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 		"ulid", meta.ULID,
 		"duration", time.Since(start),
 	)
+
+	c.metrics.write_block_duration = c.metrics.write_block_duration + uint64(time.Since(start)/1e6)
+	println("total write block duratioin (millisecond)", c.metrics.write_block_duration)
+
 	return uid, nil
 }
 

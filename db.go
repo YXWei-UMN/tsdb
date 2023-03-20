@@ -554,7 +554,6 @@ func (db *DB) run() {
 
 		select {
 		case <-time.After(1 * time.Minute):
-			println("check every 1 min in run function")
 			select {
 			case db.compactc <- struct{}{}: //每1min 检查一下是否compaction, 但其实在batch write里 每次写了一个batch的data 都会检查是否compactable，如果是就db.compactc <- struct{}{}， 所以频率会高于1min
 			default:
@@ -616,7 +615,6 @@ func (a dbAppender) Commit() error {
 			a.db.metrics.compactionsSkipped.Inc()
 		}
 		a.db.autoCompactMtx.Unlock()
-
 	}
 	return err
 }
@@ -687,7 +685,7 @@ func (db *DB) compact() (err error) {
 	}
 
 	// Check for compactions of multiple blocks.
-	/*for {
+	for {
 		plan, err := db.compactor.Plan(db.dir)
 		if err != nil {
 			return errors.Wrap(err, "plan compaction")
@@ -715,7 +713,7 @@ func (db *DB) compact() (err error) {
 			return errors.Wrap(err, "reload blocks")
 		}
 		runtime.GC()
-	}*/
+	}
 
 	return nil
 }

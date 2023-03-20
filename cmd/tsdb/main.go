@@ -176,9 +176,10 @@ func (b *writeBenchmark) run() error {
 	l := log.With(b.logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
 
 	st, err := tsdb.Open(dir, l, nil, &tsdb.Options{
+		//WALSegmentSize:    -1,
 		RetentionDuration: 32 * 60 * 60 * 1000, // 32 hrs in milliseconds
 		// time range of a block expands from 2hrs -> 4 hrs -> 8 hrs -> 16 hrs -> 32 hrs
-		BlockRanges: tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 2), // from stepsize 3 -> 2
+		BlockRanges: tsdb.ExponentialBlockRanges(30*60*1000, 6, 2), // from stepsize 3 -> 2
 	})
 	if err != nil {
 		return err
@@ -209,7 +210,7 @@ func (b *writeBenchmark) run() error {
 
 	dur, err := measureTime("ingestScrapes", func() error {
 		b.startProfiling()
-		total, err = b.ingestScrapes(labels, 30000) // 10s sampling interval, 通过改变 scrape count 来 增大采样时间
+		total, err = b.ingestScrapes(labels, 46080) // 10s sampling interval, 通过改变 scrape count 来 增大采样时间, 46080 = 128 hrs
 		if err != nil {
 			return err
 		}
@@ -234,6 +235,7 @@ func (b *writeBenchmark) run() error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -252,7 +254,7 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 
 	//写入文件时，使用带缓存的 *Writer
 	write := bufio.NewWriter(batchDuration)
-	ticker := time.NewTicker(time.Second * 10) // 每秒tick一次, ticker 似乎比timer 更精准  但都不是按秒准确计时的 Chanel的读取有波动
+	ticker := time.NewTicker(time.Second * 10) // 每10秒tick一次, ticker 似乎比timer 更精准  但都不是按秒准确计时的 Chanel的读取有波动
 	var total_in_last_tick uint64
 	total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
 	last_time := time.Now()
@@ -270,8 +272,8 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 			batch := lbls[:l]
 			lbls = lbls[l:]
 			wg.Add(1)
+			// 默认开启 TS/1000 个协程 并发插入， 可以通过改变 l:= 1xxx  来增加/减少协程数
 			go func() {
-				//打印每个batch的插入时间，不管这个batch是插入到内存还是flush到disk，latency都会受compaction影响
 				//start := time.Now()
 				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
 				//duration := int64(time.Since(start) / 1e6)
@@ -295,7 +297,6 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 			duration := uint64(time.Since(last_time) / 1e9)
 			new_insert_sample_num := total - total_in_last_tick
 			throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
-
 			//格式化写入
 			s_throughput := strconv.FormatUint(throughput, 10)
 			write.WriteString(s_throughput + "\n")
@@ -365,7 +366,7 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 			total++
 		}
 		// 注意在Add的时候其实只是插入到appender的一个临时空间 还没有显示到memseries里
-		// 因为理论上需要先commit到WAL 才可以显示在memseries里，可能为了性能， 每次batch一定量的（scrape count）的samples 再一次commit到WAL
+		// 因为理论上需要先commit到WAL 才可以显示在memseries里，可能为了性能， 每次batch一定量的（scrape count*1000 TS）的samples 再一次commit到WAL
 		//为什么增加scrape count 会 out of bound？  猜测可能是appender的临时空间不够了或者out of order 或者超越time range了？ 总之现在不需要增加每个batch 的 scrape count
 
 		if err := app.Commit(); err != nil {
