@@ -179,7 +179,7 @@ func (b *writeBenchmark) run() error {
 		//WALSegmentSize:    -1,
 		RetentionDuration: 32 * 60 * 60 * 1000, // 32 hrs in milliseconds
 		// time range of a block expands from 2hrs -> 4 hrs -> 8 hrs -> 16 hrs -> 32 hrs
-		BlockRanges: tsdb.ExponentialBlockRanges(30*60*1000, 6, 2), // from stepsize 3 -> 2
+		BlockRanges: tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 2), // from stepsize 3 -> 2
 	})
 	if err != nil {
 		return err

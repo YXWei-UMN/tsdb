@@ -595,27 +595,30 @@ func (a dbAppender) Commit() error {
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
-	if a.db.head.compactable() {
-		/*select {
-		case a.db.compactc <- struct{}{}:
-		default:
-		}*/
+	go func() {
+		if a.db.head.compactable() {
+			/*select {
+			case a.db.compactc <- struct{}{}:
+			default:
+			}*/
 
-		a.db.metrics.compactionsTriggered.Inc()
-		//a.db.DisableCompactions()
-		//println("trigger flushing")
-		//string := fmt.Sprintf("head is compactable, current head max time=%s min time=%s chunk range=%s", a.db.head.maxTime, a.db.head.minTime, a.db.head.chunkRange)
-		//fmt.Println(string)
-		a.db.autoCompactMtx.Lock()
-		if a.db.autoCompact {
-			if err := a.db.compact(); err != nil {
-				level.Error(a.db.logger).Log("msg", "compaction failed", "err", err)
+			a.db.metrics.compactionsTriggered.Inc()
+			//a.db.DisableCompactions()
+			//println("trigger flushing")
+			//string := fmt.Sprintf("head is compactable, current head max time=%s min time=%s chunk range=%s", a.db.head.maxTime, a.db.head.minTime, a.db.head.chunkRange)
+			//fmt.Println(string)
+			a.db.autoCompactMtx.Lock()
+			if a.db.autoCompact {
+				if err := a.db.compact(); err != nil {
+					level.Error(a.db.logger).Log("msg", "compaction failed", "err", err)
+				}
+			} else {
+				a.db.metrics.compactionsSkipped.Inc()
 			}
-		} else {
-			a.db.metrics.compactionsSkipped.Inc()
+			a.db.autoCompactMtx.Unlock()
 		}
-		a.db.autoCompactMtx.Unlock()
-	}
+	}()
+
 	return err
 }
 
