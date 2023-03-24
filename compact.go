@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -79,6 +80,7 @@ type LeveledCompactor struct {
 	ranges    []int64
 	chunkPool chunkenc.Pool
 	ctx       context.Context
+	mtx       sync.RWMutex
 }
 
 type compactorMetrics struct {
@@ -484,12 +486,13 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	meta.Compaction.Level = 1
 	meta.Compaction.Sources = []ulid.ULID{uid}
 
+	//Write似乎就是flush， compact 有另外的函数， 对于flush 没有parent 所以这一步似乎冗余
 	if parent != nil {
 		meta.Compaction.Parents = []BlockDesc{
 			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
 		}
 	}
-
+	//似乎还需进去write来切分
 	err := c.write(dest, meta, b)
 	if err != nil {
 		return uid, err
@@ -525,7 +528,6 @@ type instrumentedChunkWriter struct {
 
 func (w *instrumentedChunkWriter) WriteChunks(chunks ...chunks.Meta) error {
 	for _, c := range chunks {
-		//似乎是 chunk的大小 sample数目 时间都可以作为boundary
 		w.size.Observe(float64(len(c.Chunk.Bytes())))
 		w.samples.Observe(float64(c.Chunk.NumSamples()))
 		w.trange.Observe(float64(c.MaxTime - c.MinTime))
@@ -537,7 +539,7 @@ func (w *instrumentedChunkWriter) WriteChunks(chunks ...chunks.Meta) error {
 // It cleans up all files of the old blocks after completing successfully.
 func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockReader) (err error) {
 	dir := filepath.Join(dest, meta.ULID.String())
-	tmp := dir + ".tmp"
+	tmp := dir + ".tmp" //有tmp 那就有删tmp和合tmp得机会 就有multiple tmp的机会
 	var closers []io.Closer
 	defer func(t time.Time) {
 		var merr tsdb_errors.MultiError
@@ -644,6 +646,7 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 	df = nil
 
 	// Block successfully written, make visible and remove old ones.
+	//就是rename tmp 到 dir
 	if err := fileutil.Replace(tmp, dir); err != nil {
 		return errors.Wrap(err, "rename block dir")
 	}
@@ -675,7 +678,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	c.metrics.populatingBlocks.Set(1)
 
 	globalMaxt := blocks[0].Meta().MaxTime
-	// 遍历旧 block 数据
+	// 遍历 all blocks 如果是flush 就是一个block; 每个block取出一个SeriesSet， 组成一个merger （好像就是两个chunk SeriesSet 的wrap）
 	for i, b := range blocks {
 		select {
 		case <-c.ctx.Done():
@@ -729,11 +732,11 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		s := newCompactionSeriesSet(indexr, chunkr, tombsr, all)
 
 		if i == 0 {
-			set = s
+			set = s //第一个block的CompactionSeriesSet，如果有多个block （compaction），那就合并成CompactionMerger,如果是flush,那就一个CompactionSeriesSet
 			continue
 		}
 
-		// 与上一层并形成一个新的 merger
+		// 反复拿最新的block与上一层merger合并形成一个新的 merger，  但是 newCompactionMerger(set, s) 接收的是两个chunkSeriesSet啊 不是一个merger一个set
 		set, err = newCompactionMerger(set, s)
 		if err != nil {
 			return err
@@ -752,8 +755,13 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 	}
 
 	delIter := &deletedIterator{}
-	// 遍历 merger
-	for set.Next() {
+
+	// 遍历 merger 或 当前head flush下来的CompactionSeriesSet：所有series的集合
+	//这里可以开始基于series的concurrent 操作
+	for set.Next() { //这个 Next()depends on whether 你是 CompactionSeriesSet 还是merger
+		// 如果是CompactionSeriesSet， Next() 返回下一个series对应的各种信息 label set / chunks / interval (删掉的时间段/有效的时间段)
+		// 如果是merger，Next()根据label有序return下一个series （可以是组成merger的两个seriesSet里任意的一个series）. 因为是有序，如果两个seriesSet包含同一个series时，这个series的chunk和interval会被合并，加上label Set 一起返回
+
 		select {
 		case <-c.ctx.Done():
 			return c.ctx.Err()
@@ -773,6 +781,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			continue
 		}
 
+		//只是对该series的chunks里的每个chunk做一些检查 如果有问题就re encode，暂时没看懂具体做的什么
 		for i, chk := range chks {
 			// Re-encode head chunks that are still open (being appended to) or
 			// outside the compacted MaxTime range.
@@ -832,10 +841,17 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 				return errors.Wrap(err, "merge overlapping chunks")
 			}
 		}
+
+		//后续开始update各种共享数据 所以需要lock
+		c.mtx.Lock()
+
+		//简单看了 chunks.go 里实现的WriteChunks, 应该就是把属于一个series的多个chunk写一起
+		//官方的话是：serializes a time block of chunked series data
 		if err := chunkw.WriteChunks(mergedChks...); err != nil {
 			return errors.Wrap(err, "write chunks")
 		}
 
+		// 具体实现在index.go里, 插入series 构建到chunk的index
 		if err := indexw.AddSeries(i, lset, mergedChks...); err != nil {
 			return errors.Wrap(err, "add series")
 		}
@@ -846,6 +862,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
 		}
 
+		//TODO 这里和上面的WriteChunks的区别是？？
 		for _, chk := range mergedChks {
 			if err := c.chunkPool.Put(chk.Chunk); err != nil {
 				return errors.Wrap(err, "put chunk")
@@ -860,10 +877,254 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 			valset.set(l.Value)
 		}
+		c.mtx.Unlock()
+		//这里自己有锁了
 		postings.Add(i, lset)
 
 		i++
 	}
+
+	// 遍历 merger 或 当前head flush下来的CompactionSeriesSet：所有series的集合
+	//这里可以开始基于series的concurrent 操作
+
+	/*re:
+	for true { //这个 Next()depends on whether 你是 CompactionSeriesSet 还是merger
+		// 如果是CompactionSeriesSet， Next() 返回下一个series对应的各种信息 label set / chunks / interval (删掉的时间段/有效的时间段)
+		// 如果是merger，Next()根据label有序return下一个series （可以是组成merger的两个seriesSet里任意的一个series）. 因为是有序，如果两个seriesSet包含同一个series时，这个series的chunk和interval会被合并，加上label Set 一起返回
+
+		numOfWorkers := 8
+
+		worker0ch := make(chan struct{}, 1)
+		worker1ch := make(chan struct{}, 1)
+		worker2ch := make(chan struct{}, 1)
+		worker3ch := make(chan struct{}, 1)
+		worker4ch := make(chan struct{}, 1)
+		worker5ch := make(chan struct{}, 1)
+		worker6ch := make(chan struct{}, 1)
+		worker7ch := make(chan struct{}, 1)
+		worker0ch <- struct{}{}
+
+		var wg sync.WaitGroup
+		for k := 0; k < numOfWorkers; k++ {
+			j := k
+
+			if !set.Next() {
+				break re //跳到re 跳出for 循环
+			}
+
+			lset_global, chks_global, dranges_global := set.At() // The chunks here are not fully deleted.
+			//lset_local := lset_global
+			//chks_local := chks_global
+			//dranges_local := dranges_global
+			lset_local := make(labels.Labels, len(lset_global))
+			copy(lset_local, lset_global)
+			chks_local := make([]chunks.Meta, len(chks_global))
+			copy(chks_local, chks_global)
+			dranges_local := make([]Interval, len(dranges_global))
+			copy(dranges_local, dranges_global)
+
+			//TODO 到时候直接拆解Next函数
+
+			//va := lset_local.Get("host")
+			//println(j, "outside go func", va, &lset_global, &lset_local)
+
+			//是同一个set 被多个goroutine共用， call的都是一个series, 所以用一个tmp 变量传进去 set是只读的所以没事
+
+			wg.Add(1)
+			//thread_num 是有序的  label越小 thread num越小
+			go func(thread_num int) (err error) {
+
+				select {
+				case <-c.ctx.Done():
+					return c.ctx.Err()
+				default:
+				}
+
+				//va1 := lset_local.Get("host")
+				//println(j, "inside go func", va1, &lset_local)
+
+				if overlapping {
+					// If blocks are overlapping, it is possible to have unsorted chunks.
+					sort.Slice(chks_local, func(i, j int) bool {
+						return chks_local[i].MinTime < chks_local[j].MinTime
+					})
+				}
+
+				// Skip the series with all deleted chunks.
+				if len(chks_local) == 0 {
+					runtime.Goexit()
+				}
+				//只是对该series的chunks里的每个chunk做一些检查 如果有问题就re encode，暂时没看懂具体做的什么
+				for i, chk := range chks_local {
+					// Re-encode head chunks that are still open (being appended to) or
+					// outside the compacted MaxTime range.
+					// The chunk.Bytes() method is not safe for open chunks hence the re-encoding.
+					// This happens when snapshotting the head block.
+					//
+					// Block time range is half-open: [meta.MinTime, meta.MaxTime) and
+					// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
+					//
+					// TODO think how to avoid the typecasting to verify when it is head block.
+					if _, isHeadChunk := chk.Chunk.(*safeChunk); isHeadChunk && chk.MaxTime >= meta.MaxTime {
+						dranges_local = append(dranges_local, Interval{Mint: meta.MaxTime, Maxt: math.MaxInt64})
+
+					} else
+					// Sanity check for disk blocks.
+					// chk.MaxTime == meta.MaxTime shouldn't happen as well, but will brake many users so not checking for that.
+					if chk.MinTime < meta.MinTime || chk.MaxTime > meta.MaxTime {
+						return errors.Errorf("found chunk with minTime: %d maxTime: %d outside of compacted minTime: %d maxTime: %d",
+							chk.MinTime, chk.MaxTime, meta.MinTime, meta.MaxTime)
+					}
+
+					if len(dranges_local) > 0 {
+						// Re-encode the chunk to not have deleted values.
+						if !chk.OverlapsClosedInterval(dranges_local[0].Mint, dranges_local[len(dranges_local)-1].Maxt) {
+							continue
+						}
+						newChunk := chunkenc.NewXORChunk()
+						app, err := newChunk.Appender()
+						if err != nil {
+							return err
+						}
+
+						//TODO 这里似乎也有冲突 不过我们目前没有删除 所以可以先放着
+						delIter.it = chk.Chunk.Iterator(delIter.it)
+						delIter.intervals = dranges_local
+
+						var (
+							t int64
+							v float64
+						)
+						for delIter.Next() {
+							t, v = delIter.At()
+							app.Append(t, v)
+						}
+						if err := delIter.Err(); err != nil {
+							return errors.Wrap(err, "iterate chunk while re-encoding")
+						}
+
+						chks_local[i].Chunk = newChunk
+						chks_local[i].MaxTime = t
+					}
+				}
+
+				mergedChks := chks_local
+				if overlapping {
+					mergedChks, err = chunks.MergeOverlappingChunks(chks_local)
+					if err != nil {
+						return errors.Wrap(err, "merge overlapping chunks")
+					}
+				}
+
+				//println(j, " waiting for the channel-", thread_num)
+
+				if thread_num == 0 {
+					select {
+					case <-worker0ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 1 {
+					select {
+					case <-worker1ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 2 {
+					select {
+					case <-worker2ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 3 {
+					select {
+					case <-worker3ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 4 {
+					select {
+					case <-worker4ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 5 {
+					select {
+					case <-worker5ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 6 {
+					select {
+					case <-worker6ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				} else if thread_num == 7 {
+					select {
+					case <-worker7ch:
+						//fmt.Println("get channel thread-", thread_num)
+					}
+				}
+
+				//因为是time based block， 所有series的chunk和index都在一个block里，哪怕按照series并行了，在写block的时候还是需要lock. 不过因为我们前面利用channel实现了有序写 所以等同于有lock了
+				//c.mtx.Lock()
+
+				//简单看了 chunks.go 里实现的WriteChunks, 应该就是把属于一个series的多个chunk写一起
+				//官方的话是：serializes a time block of chunked series data
+				if err := chunkw.WriteChunks(mergedChks...); err != nil {
+					return errors.Wrap(err, "write chunks")
+				}
+
+				// 具体实现在index.go里, 插入series, 构建到chunk的index
+				if err := indexw.AddSeries(i, lset_local, mergedChks...); err != nil {
+					return errors.Wrap(err, "add series")
+				}
+
+				meta.Stats.NumChunks += uint64(len(mergedChks))
+				meta.Stats.NumSeries++
+				for _, chk := range mergedChks {
+					meta.Stats.NumSamples += uint64(chk.Chunk.NumSamples())
+				}
+
+				//TODO 这里和上面的WriteChunks的区别是？？
+				for _, chk := range mergedChks {
+					if err := c.chunkPool.Put(chk.Chunk); err != nil {
+						return errors.Wrap(err, "put chunk")
+					}
+				}
+
+				for _, l := range lset_local {
+					valset, ok := values[l.Name]
+					if !ok {
+						valset = stringset{}
+						values[l.Name] = valset
+					}
+					valset.set(l.Value)
+				}
+				//c.mtx.Unlock()
+				//这里自己有锁了
+				postings.Add(i, lset_local)
+
+				i++
+				wg.Done()
+
+				if thread_num == 0 {
+					worker1ch <- struct{}{}
+				} else if thread_num == 1 {
+					worker2ch <- struct{}{}
+				} else if thread_num == 2 {
+					worker3ch <- struct{}{}
+				} else if thread_num == 3 {
+					worker4ch <- struct{}{}
+				} else if thread_num == 4 {
+					worker5ch <- struct{}{}
+				} else if thread_num == 5 {
+					worker6ch <- struct{}{}
+				} else if thread_num == 6 {
+					worker7ch <- struct{}{}
+				} else if thread_num == 7 {
+
+				}
+				return nil
+			}(j)
+		}
+		wg.Wait()
+	}*/
+
 	if set.Err() != nil {
 		return errors.Wrap(set.Err(), "iterate compaction set")
 	}
@@ -915,12 +1176,14 @@ func (c *compactionSeriesSet) Next() bool {
 	}
 	var err error
 
-	c.intervals, err = c.tombstones.Get(c.p.At())
+	//c.p.At()大概是return一个series Ref，还没看posting的构造 不知道为什么posting的iterator会return series Ref
+	c.intervals, err = c.tombstones.Get(c.p.At()) //这里的intervals是deleted time range (tombstones) 也许后续会有反转来获得真的intervals
 	if err != nil {
 		c.err = errors.Wrap(err, "get tombstones")
 		return false
 	}
 
+	//根据c.p.At() return的series Ref 去index里获得对应series的label set 和 chunks (chunks = a set of chunks 本质上是 []chunks.meta   Meta holds information about a chunk of data. )
 	if err = c.index.Series(c.p.At(), &c.l, &c.c); err != nil {
 		c.err = errors.Wrapf(err, "get series %d", c.p.At())
 		return false
@@ -938,6 +1201,7 @@ func (c *compactionSeriesSet) Next() bool {
 		c.c = chks
 	}
 
+	//检查在Next()里获得的chunks 是不是在chunk reader里也有存在
 	for i := range c.c {
 		chk := &c.c[i]
 
@@ -1005,6 +1269,7 @@ func (c *compactionMerger) Next() bool {
 	var lset labels.Labels
 	var chks []chunks.Meta
 
+	//比较两个SeriesSet各自的下一个series的LabelSet来比较
 	d := c.compare()
 	if d > 0 {
 		lset, chks, c.intervals = c.b.At()

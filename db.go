@@ -528,8 +528,8 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		}
 	}
 
-	//TODO run 方法在 Open 时被调用, 在一个单独的 goroutine 中执行, 主要是定期对数据进行compaction
-	go db.run()
+	// run 方法在 Open 时被调用, 在一个单独的 goroutine 中执行, 主要是定期对数据进行compaction. 但是该协程没有同步机制 在benchmark的压力测试下 会有大量写无法被flush和compact 导致爆内存 因此我们把compaction的检查机制移到了写数据的后面 （也是开个go routine来异步执行，但是加上wait group来保证同步 等待同步的过程类似write stall）
+	//go db.run()
 
 	return db, nil
 }
@@ -595,13 +595,15 @@ func (a dbAppender) Commit() error {
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
-	go func() {
-		if a.db.head.compactable() {
-			/*select {
-			case a.db.compactc <- struct{}{}:
-			default:
-			}*/
 
+	if a.db.head.compactable() {
+		/*select {
+		case a.db.compactc <- struct{}{}:
+		default:
+		}*/
+		var wg_compaction sync.WaitGroup
+		wg_compaction.Add(1)
+		go func() {
 			a.db.metrics.compactionsTriggered.Inc()
 			//a.db.DisableCompactions()
 			//println("trigger flushing")
@@ -616,8 +618,10 @@ func (a dbAppender) Commit() error {
 				a.db.metrics.compactionsSkipped.Inc()
 			}
 			a.db.autoCompactMtx.Unlock()
-		}
-	}()
+			wg_compaction.Done()
+		}()
+		wg_compaction.Wait()
+	}
 
 	return err
 }
@@ -645,13 +649,14 @@ func (db *DB) compact() (err error) {
 			return nil
 		default:
 		}
-		if !db.head.compactable() { //如果这个head的时间超过了既定range的3/2 就是compactable
+		if !db.head.compactable() { //如果这个head的时间超过了既定range的3/2 就是compactable. 之前我们在外面concurrent compaction不会出错就是因为每次compaction有锁，compact完了head就不在compactable了，其他concurrent的compaction在这里就停止了
 			break
 		}
 		mint := db.head.MinTime()
-		maxt := rangeForTimestamp(mint, db.head.chunkRange)
+		maxt := rangeForTimestamp(mint, db.head.chunkRange) //向上取个 chunkRange倍数的整
 
 		// Wrap head into a range that bounds all reads to it.
+		//TODO 这里可以做time based的切分来concurrent compaction/flushing
 		head := &rangeHead{
 			head: db.head,
 			mint: mint,
@@ -663,6 +668,7 @@ func (db *DB) compact() (err error) {
 			// from the block interval here.
 			maxt: maxt - 1,
 		}
+		//TODO 但现在Write是往里flush一个block 得确保split work给concurrent jobs, 所以可能得进入Write里面再做切分而不是在这里切分
 		uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
 		if err != nil {
 			return errors.Wrap(err, "persist head block")
@@ -670,7 +676,9 @@ func (db *DB) compact() (err error) {
 
 		runtime.GC()
 
+		//reload 在这里应该是重新清理一遍head里对block的认知 因为有新block写入 同时head里也需要GC truncate 老head
 		if err := db.reload(); err != nil {
+			//如果reload失败， for consistency 就把刚写下去的block删掉
 			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
 				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid)
 			}

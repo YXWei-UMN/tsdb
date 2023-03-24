@@ -246,7 +246,7 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 	var mu sync.Mutex
 	var total uint64
 
-	batchDuration, err := os.Create(filepath.Join(b.outPath, "batch.duration"))
+	batchDuration, err := os.Create(filepath.Join(b.outPath, "varying_throughput"))
 	if err != nil {
 		fmt.Println(" err", err)
 	}
@@ -254,10 +254,10 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 
 	//写入文件时，使用带缓存的 *Writer
 	write := bufio.NewWriter(batchDuration)
-	ticker := time.NewTicker(time.Second * 10) // 每10秒tick一次, ticker 似乎比timer 更精准  但都不是按秒准确计时的 Chanel的读取有波动
-	var total_in_last_tick uint64
-	total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
-	last_time := time.Now()
+	ticker := time.NewTicker(time.Second * 20) // 等跑大数据集 1min 一次，尽量减少干扰
+	//var total_in_last_tick uint64
+	//total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
+	start := time.Now()
 
 	for i := 0; i < scrapeCount; i += 100 {
 		var wg sync.WaitGroup
@@ -293,22 +293,23 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 		wg.Wait()
 
 		select {
-		case t := <-ticker.C:
-			duration := uint64(time.Since(last_time) / 1e9)
-			new_insert_sample_num := total - total_in_last_tick
-			throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
+		case <-ticker.C:
+			duration := time.Since(start) / 1e9
+			//new_insert_sample_num := total - total_in_last_tick
+			throughput := total / uint64(duration) //现在的throughput是 samples/second
 			//格式化写入
-			s_throughput := strconv.FormatUint(throughput, 10)
+			s_throughput := strconv.FormatUint(uint64(throughput), 10)
 			write.WriteString(s_throughput + "\n")
 
 			//更新last time 和 last total
-			last_time = t
-			total_in_last_tick = total
+			//last_time = time.Now()
+			//total_in_last_tick = total
+
+			//Flush将缓存的文件真正写入到文件中
+			write.Flush()
 		default:
 		}
 
-		//Flush将缓存的文件真正写入到文件中
-		write.Flush()
 	}
 	fmt.Println("ingestion completed")
 
