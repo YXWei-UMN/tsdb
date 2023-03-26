@@ -971,6 +971,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 					} else
 					// Sanity check for disk blocks.
 					// chk.MaxTime == meta.MaxTime shouldn't happen as well, but will brake many users so not checking for that.
+					//TODO here might be a problem, time based concurrent flush has smaller meta.min/meta.max time compared with chunks. probably need to flush chunks based on time???
 					if chk.MinTime < meta.MinTime || chk.MaxTime > meta.MaxTime {
 						return errors.Errorf("found chunk with minTime: %d maxTime: %d outside of compacted minTime: %d maxTime: %d",
 							chk.MinTime, chk.MaxTime, meta.MinTime, meta.MaxTime)

@@ -668,6 +668,7 @@ func (h *Head) Truncate(mint int64) (err error) {
 		level.Error(h.logger).Log("msg", "delete old checkpoints", "err", err)
 		h.metrics.checkpointDeleteFail.Inc()
 	}
+
 	h.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
 	h.metrics.WALcheckpoint_duration = h.metrics.WALcheckpoint_duration + uint64(time.Since(start)/1e6)
 
@@ -744,6 +745,7 @@ func (a *initAppender) Add(lset labels.Labels, t int64, v float64) (uint64, erro
 	if a.app != nil {
 		return a.app.Add(lset, t, v)
 	}
+
 	a.head.initTime(t)
 	a.app = a.head.appender()
 
@@ -946,9 +948,9 @@ func (a *headAppender) Commit() error {
 
 	for _, s := range a.samples {
 		s.series.Lock() //每一个sample有对应memseries的指针
-		//为什么log有写 这里还再写一次？ 这里是headerAppender.samples数据写到其对应的memSeries中
+		//这里是headerAppender.samples数据写到其对应的memSeries中
 		ok, chunkCreated := s.series.append(s.T, s.V)
-		s.series.pendingCommit = false //TODO 这里似乎是有个问题的 每次batch了 1000个series的各100个samples，理应等100samples写完再把对应series的pending解除
+		s.series.pendingCommit = false
 		s.series.Unlock()
 
 		if !ok {
@@ -961,6 +963,11 @@ func (a *headAppender) Commit() error {
 	}
 
 	a.head.metrics.samplesAppended.Add(float64(total))
+
+	//每个batch（1000TS 各100data=1000秒）的每一个十秒，main.go会创建一个新的head.appender buffer住这batch里1000个TS在这一时刻的各自一个（共1000）data,并且appender会有相应的Mint Maxt
+	// 根据appender的 mint maxt 时刻更新head的mint maxt
+	//所以可以认为head的maxt是随着data插入而变动的
+	//每一个head一开始的mint是最大int，在插入第一个data point时 appender里mint更新， appender commit时，head的mint更新
 	a.head.updateMinMaxTime(a.mint, a.maxt)
 
 	return nil
@@ -1729,13 +1736,13 @@ func (s *memSeries) appendable(t int64, v float64) error {
 		return nil
 	}
 	if t < c.maxTime {
-		return ErrOutOfOrderSample
+		t = c.maxTime
 	}
 	// We are allowing exact duplicates as we can encounter them in valid cases
 	// like federation and erroring out at that time would be extremely noisy.
-	if math.Float64bits(s.sampleBuf[3].v) != math.Float64bits(v) {
+	/*if math.Float64bits(s.sampleBuf[3].v) != math.Float64bits(v) {
 		return ErrAmendSample
-	}
+	}*/
 	return nil
 }
 

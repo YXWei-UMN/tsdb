@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -65,8 +64,8 @@ func execute() (err error) {
 		analyzeLimit         = analyzeCmd.Flag("limit", "how many items to show in each list").Default("20").Int()
 		dumpCmd              = cli.Command("dump", "dump samples from a TSDB")
 		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
-		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
-		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
+		//dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
+		//dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
@@ -135,7 +134,7 @@ func execute() (err error) {
 			merr.Add(db.Close())
 			err = merr.Err()
 		}()
-		return dumpSamples(db, *dumpMinTime, *dumpMaxTime)
+		//return dumpSamples(db, *dumpMinTime, *dumpMaxTime)
 	}
 	return nil
 }
@@ -337,8 +336,21 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 	total := uint64(0)
 
 	for i := 0; i < scrapeCount; i++ {
-		app := b.storage.Appender()
 		ts += timeDelta
+
+		//time based  0.5 hr = 30*60*1000 millisecond
+		var app = b.storage.Appender_time1()
+		head_id := (ts/(30*60*1000))%4 + 1
+
+		if head_id == 1 {
+			//do nothing
+		} else if head_id == 2 {
+			app = b.storage.Appender_time2()
+		} else if head_id == 3 {
+			app = b.storage.Appender_time3()
+		} else if head_id == 4 {
+			app = b.storage.Appender_time4()
+		}
 
 		for _, s := range scrape {
 			s.value += 1000
@@ -667,7 +679,7 @@ func analyzeBlock(b tsdb.BlockReader, limit int) error {
 	return nil
 }
 
-func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
+/*func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 
 	q, err := db.Querier(mint, maxt)
 	if err != nil {
@@ -702,4 +714,4 @@ func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 		return ss.Err()
 	}
 	return nil
-}
+}*/

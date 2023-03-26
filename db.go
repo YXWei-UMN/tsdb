@@ -43,6 +43,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var concurrent_mode = 2 // 1 = original  2 = time based  3 = TS based
+
 // DefaultOptions used for the DB. They are sane for setups using
 // millisecond precision timestamps.
 var DefaultOptions = &Options{
@@ -128,7 +130,20 @@ type DB struct {
 	mtx    sync.RWMutex
 	blocks []*Block
 
-	head *Head
+	//head *Head
+	Time_head1 *Head
+	Time_head2 *Head
+	Time_head3 *Head
+	Time_head4 *Head
+	//TODO DB的open 和 head init
+	//TODO 插入data到哪一个head的判断
+	//TODO compactable检查 不再是一个head的时间
+	//TODO 最终调用flush 多个goroutine各传入一个head
+
+	TS_head1 *Head
+	TS_head2 *Head
+	TS_head3 *Head
+	TS_head4 *Head
 
 	compactc chan struct{}
 	donec    chan struct{}
@@ -217,7 +232,11 @@ func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
 		db.mtx.RLock()
 		defer db.mtx.RUnlock()
 		if len(db.blocks) == 0 {
-			return float64(db.head.minTime)
+			if concurrent_mode == 2 {
+				return float64(db.Time_head1.minTime)
+			} else if concurrent_mode == 3 {
+				return float64(db.TS_head1.minTime)
+			}
 		}
 		return float64(db.blocks[0].meta.MinTime)
 	})
@@ -289,7 +308,7 @@ func OpenDBReadOnly(dir string, l log.Logger) (*DBReadOnly, error) {
 
 // Querier loads the wal and returns a new querier over the data partition for the given time range.
 // Current implementation doesn't support multiple Queriers.
-func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
+/*func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 	select {
 	case <-db.closed:
 		return nil, ErrClosed
@@ -347,11 +366,12 @@ func (db *DBReadOnly) Querier(mint, maxt int64) (Querier, error) {
 		dir:    db.dir,
 		logger: db.logger,
 		blocks: blocks,
-		head:   head,
+		//TODO here head is not processed -wyx
+		//head:   head,
 	}
 
 	return dbWritable.Querier(mint, maxt)
-}
+}*/
 
 // Blocks returns a slice of block readers for persisted blocks.
 func (db *DBReadOnly) Blocks() ([]BlockReader, error) {
@@ -501,8 +521,19 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 			return nil, err
 		}
 	}
+	//TODO when create multiple heads, do we need to give different wlog?
+	if concurrent_mode == 2 {
+		db.Time_head1, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.Time_head2, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.Time_head3, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.Time_head4, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+	} else if concurrent_mode == 3 {
+		db.TS_head1, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.TS_head2, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.TS_head3, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+		db.TS_head4, err = NewHead(r, l, wlog, opts.BlockRanges[0])
+	}
 
-	db.head, err = NewHead(r, l, wlog, opts.BlockRanges[0])
 	if err != nil {
 		return nil, err
 	}
@@ -520,11 +551,70 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		minValidTime = blocks[len(blocks)-1].Meta().MaxTime
 	}
 
-	if initErr := db.head.Init(minValidTime); initErr != nil {
-		db.head.metrics.walCorruptionsTotal.Inc()
-		level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
-		if err := wlog.Repair(initErr); err != nil {
-			return nil, errors.Wrap(err, "repair corrupted WAL")
+	//这里是通过读WAL checkpoint来init head 的 最小有效时间 感觉可以不用改 直接在写data的地方通过timestamp / TS 分配要写的head就行
+	if concurrent_mode == 2 {
+		if initErr := db.Time_head1.Init(minValidTime); initErr != nil {
+			db.Time_head1.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.Time_head2.Init(minValidTime); initErr != nil {
+			db.Time_head2.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.Time_head3.Init(minValidTime); initErr != nil {
+			db.Time_head3.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.Time_head4.Init(minValidTime); initErr != nil {
+			db.Time_head4.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+	} else if concurrent_mode == 3 {
+		if initErr := db.TS_head1.Init(minValidTime); initErr != nil {
+			db.TS_head1.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.TS_head2.Init(minValidTime); initErr != nil {
+			db.TS_head2.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.TS_head3.Init(minValidTime); initErr != nil {
+			db.TS_head3.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
+		}
+
+		if initErr := db.TS_head4.Init(minValidTime); initErr != nil {
+			db.TS_head4.metrics.walCorruptionsTotal.Inc()
+			level.Warn(db.logger).Log("msg", "encountered WAL read error, attempting repair", "err", err)
+			if err := wlog.Repair(initErr); err != nil {
+				return nil, errors.Wrap(err, "repair corrupted WAL")
+			}
 		}
 	}
 
@@ -579,8 +669,36 @@ func (db *DB) run() {
 }
 
 // Appender opens a new appender against the database.
-func (db *DB) Appender() Appender {
-	return dbAppender{db: db, Appender: db.head.Appender()}
+func (db *DB) Appender_time1() Appender {
+	return dbAppender{db: db, Appender: db.Time_head1.Appender()}
+}
+
+func (db *DB) Appender_time2() Appender {
+	return dbAppender{db: db, Appender: db.Time_head2.Appender()}
+}
+
+func (db *DB) Appender_time3() Appender {
+	return dbAppender{db: db, Appender: db.Time_head3.Appender()}
+}
+
+func (db *DB) Appender_time4() Appender {
+	return dbAppender{db: db, Appender: db.Time_head4.Appender()}
+}
+
+func (db *DB) Appender_ts1() Appender {
+	return dbAppender{db: db, Appender: db.TS_head1.Appender()}
+}
+
+func (db *DB) Appender_ts2() Appender {
+	return dbAppender{db: db, Appender: db.TS_head2.Appender()}
+}
+
+func (db *DB) Appender_ts3() Appender {
+	return dbAppender{db: db, Appender: db.TS_head3.Appender()}
+}
+
+func (db *DB) Appender_ts4() Appender {
+	return dbAppender{db: db, Appender: db.TS_head4.Appender()}
 }
 
 // dbAppender wraps the DB's head appender and triggers compactions on commit
@@ -591,36 +709,46 @@ type dbAppender struct {
 }
 
 func (a dbAppender) Commit() error {
+	//在headAppender.Commit里有update head time
 	err := a.Appender.Commit()
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
+	// TODO compactable 的判断不再是head本身 而是all heads
 
-	if a.db.head.compactable() {
+	// if a.db.head.compactable() { //return h.MaxTime()-h.MinTime() > h.chunkRange/2*3
+
+	if (a.db.Time_head4.maxTime != math.MinInt64) && (a.db.Time_head4.maxTime-a.db.Time_head1.minTime) > a.db.Time_head1.chunkRange/2*3 {
+		//when assign new head, the chunkrange is set as the first element of opts.BlockRanges[0]. So it is 2hr in millisecond
+		/*println("check each head mint maxt")
+		println(a.db.Time_head1.MinTime(), " ", a.db.Time_head1.MaxTime(), " ", a.db.Time_head1.chunkRange)
+		println(a.db.Time_head2.MinTime(), " ", a.db.Time_head2.MaxTime(), " ", a.db.Time_head2.chunkRange)
+		println(a.db.Time_head3.MinTime(), " ", a.db.Time_head3.MaxTime(), " ", a.db.Time_head3.chunkRange)
+		println(a.db.Time_head4.MinTime(), " ", a.db.Time_head4.MaxTime(), " ", a.db.Time_head4.chunkRange)*/
 		/*select {
 		case a.db.compactc <- struct{}{}:
 		default:
 		}*/
-		var wg_compaction sync.WaitGroup
-		wg_compaction.Add(1)
-		go func() {
-			a.db.metrics.compactionsTriggered.Inc()
-			//a.db.DisableCompactions()
-			//println("trigger flushing")
-			//string := fmt.Sprintf("head is compactable, current head max time=%s min time=%s chunk range=%s", a.db.head.maxTime, a.db.head.minTime, a.db.head.chunkRange)
-			//fmt.Println(string)
-			a.db.autoCompactMtx.Lock()
-			if a.db.autoCompact {
-				if err := a.db.compact(); err != nil {
-					level.Error(a.db.logger).Log("msg", "compaction failed", "err", err)
-				}
-			} else {
-				a.db.metrics.compactionsSkipped.Inc()
+		//var wg_compaction sync.WaitGroup
+		//wg_compaction.Add(1)
+		//go func() {
+		a.db.metrics.compactionsTriggered.Inc()
+		//a.db.DisableCompactions()
+		//println("trigger flushing")
+		//string := fmt.Sprintf("head is compactable, current head max time=%s min time=%s chunk range=%s", a.db.head.maxTime, a.db.head.minTime, a.db.head.chunkRange)
+		//fmt.Println(string)
+		a.db.autoCompactMtx.Lock()
+		if a.db.autoCompact {
+			if err := a.db.compact(); err != nil {
+				level.Error(a.db.logger).Log("msg", "compaction failed", "err", err)
 			}
-			a.db.autoCompactMtx.Unlock()
-			wg_compaction.Done()
-		}()
-		wg_compaction.Wait()
+		} else {
+			a.db.metrics.compactionsSkipped.Inc()
+		}
+		a.db.autoCompactMtx.Unlock()
+		//wg_compaction.Done()
+		//}()
+		//wg_compaction.Wait()
 	}
 
 	return err
@@ -649,46 +777,163 @@ func (db *DB) compact() (err error) {
 			return nil
 		default:
 		}
-		if !db.head.compactable() { //如果这个head的时间超过了既定range的3/2 就是compactable. 之前我们在外面concurrent compaction不会出错就是因为每次compaction有锁，compact完了head就不在compactable了，其他concurrent的compaction在这里就停止了
+		if !(db.Time_head4.maxTime-db.Time_head1.minTime > db.Time_head1.chunkRange/2*3) { //如果这个head的时间超过了既定range的3/2 就是compactable. 之前我们在外面concurrent compaction不会出错就是因为每次compaction有锁，compact完了head就不在compactable了，其他concurrent的compaction在这里就停止了
 			break
 		}
-		mint := db.head.MinTime()
-		maxt := rangeForTimestamp(mint, db.head.chunkRange) //向上取个 chunkRange倍数的整
 
-		// Wrap head into a range that bounds all reads to it.
-		//TODO 这里可以做time based的切分来concurrent compaction/flushing
-		head := &rangeHead{
-			head: db.head,
-			mint: mint,
-			// We remove 1 millisecond from maxt because block
-			// intervals are half-open: [b.MinTime, b.MaxTime). But
-			// chunk intervals are closed: [c.MinTime, c.MaxTime];
-			// so in order to make sure that overlaps are evaluated
-			// consistently, we explicitly remove the last value
-			// from the block interval here.
-			maxt: maxt - 1,
-		}
-		//TODO 但现在Write是往里flush一个block 得确保split work给concurrent jobs, 所以可能得进入Write里面再做切分而不是在这里切分
-		uid, err := db.compactor.Write(db.dir, head, mint, maxt, nil)
-		if err != nil {
-			return errors.Wrap(err, "persist head block")
-		}
+		//TODO 这里可以做time based/TS based切分来concurrent flushing,
+		//todo 2 - 确认每个head的maxt用自己的还是统一的 如果是time based的情况, 目前是每个head各自的maxt
+		//TODO create 4 heads, 每个head接受不同时间段或不同TS。 expectation是 time based要差 因为 go over all TS multiple times
 
+		var uid1, uid2, uid3, uid4 ulid.ULID
+		var err1, err2, err3, err4 error
+		var maxt1, maxt2, maxt3, maxt4 int64
+		//head1
+		var wg_time_head1_4 sync.WaitGroup
+		wg_time_head1_4.Add(4)
+		go func() {
+			mint1 := db.Time_head1.MinTime()
+			maxt1 = rangeForTimestamp(mint1, 30*60*1000) //向上取个 0.5hr 倍数的整, 这里的maxt其实只是要flush的time range的maxt，但其实head里还有更max的data 所以不用head本身的maxt
+
+			time_head1 := &rangeHead{
+				head: db.Time_head1,
+				mint: mint1,
+				// We remove 1 millisecond from maxt because block
+				// intervals are half-open: [b.MinTime, b.MaxTime). But
+				// chunk intervals are closed: [c.MinTime, c.MaxTime];
+				// so in order to make sure that overlaps are evaluated
+				// consistently, we explicitly remove the last value
+				// from the block interval here.
+				maxt: maxt1 - 1,
+			}
+			//这里给的是db/benchout 在里面还会根据每个block的id再有子目录 所以这里不用单独划分不同目录
+			uid1, err1 = db.compactor.Write(db.dir, time_head1, mint1, maxt1, nil)
+			if err1 != nil {
+				println("error in persist head block - time head 1")
+			}
+			wg_time_head1_4.Done()
+		}()
+
+		//head2
+		go func() {
+			mint2 := db.Time_head2.MinTime()
+			maxt2 = rangeForTimestamp(mint2, 30*60*1000) //向上取个 0.5hr 倍数的整
+
+			time_head2 := &rangeHead{
+				head: db.Time_head2,
+				mint: mint2,
+				// We remove 1 millisecond from maxt because block
+				// intervals are half-open: [b.MinTime, b.MaxTime). But
+				// chunk intervals are closed: [c.MinTime, c.MaxTime];
+				// so in order to make sure that overlaps are evaluated
+				// consistently, we explicitly remove the last value
+				// from the block interval here.
+				maxt: maxt2 - 1,
+			}
+			uid2, err2 = db.compactor.Write(db.dir, time_head2, mint2, maxt2, nil)
+			if err2 != nil {
+				println("error in persist head block - time head 2")
+			}
+			wg_time_head1_4.Done()
+		}()
+
+		//head3
+		go func() {
+			mint3 := db.Time_head3.MinTime()
+			maxt3 = rangeForTimestamp(mint3, 30*60*1000) //向上取个 0.5hr 倍数的整
+
+			time_head3 := &rangeHead{
+				head: db.Time_head3,
+				mint: mint3,
+				// We remove 1 millisecond from maxt because block
+				// intervals are half-open: [b.MinTime, b.MaxTime). But
+				// chunk intervals are closed: [c.MinTime, c.MaxTime];
+				// so in order to make sure that overlaps are evaluated
+				// consistently, we explicitly remove the last value
+				// from the block interval here.
+				maxt: maxt3 - 1,
+			}
+			uid3, err3 = db.compactor.Write(db.dir, time_head3, mint3, maxt3, nil)
+			if err3 != nil {
+				println("error in persist head block - time head 3")
+			}
+			wg_time_head1_4.Done()
+		}()
+
+		//head4
+		go func() {
+			mint4 := db.Time_head4.MinTime()
+			maxt4 = rangeForTimestamp(mint4, 30*60*1000) //向上取个 0.5hr 倍数的整
+
+			time_head4 := &rangeHead{
+				head: db.Time_head4,
+				mint: mint4,
+				// We remove 1 millisecond from maxt because block
+				// intervals are half-open: [b.MinTime, b.MaxTime). But
+				// chunk intervals are closed: [c.MinTime, c.MaxTime];
+				// so in order to make sure that overlaps are evaluated
+				// consistently, we explicitly remove the last value
+				// from the block interval here.
+				maxt: maxt4 - 1,
+			}
+			uid4, err4 = db.compactor.Write(db.dir, time_head4, mint4, maxt4, nil)
+			if err4 != nil {
+				println("error in persist head block - time head 4")
+			}
+			wg_time_head1_4.Done()
+		}()
+
+		wg_time_head1_4.Wait()
 		runtime.GC()
 
 		//reload 在这里应该是重新清理一遍head里对block的认知 因为有新block写入 同时head里也需要GC truncate 老head
+		//在这里也有并发 truncate的并发
 		if err := db.reload(); err != nil {
 			//如果reload失败， for consistency 就把刚写下去的block删掉
-			if err := os.RemoveAll(filepath.Join(db.dir, uid.String())); err != nil {
-				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid)
+			if err := os.RemoveAll(filepath.Join(db.dir, uid1.String())); err != nil {
+				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid1)
+			}
+			if err := os.RemoveAll(filepath.Join(db.dir, uid2.String())); err != nil {
+				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid2)
+			}
+			if err := os.RemoveAll(filepath.Join(db.dir, uid3.String())); err != nil {
+				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid3)
+			}
+			if err := os.RemoveAll(filepath.Join(db.dir, uid4.String())); err != nil {
+				return errors.Wrapf(err, "delete persisted head block after failed db reload:%s", uid4)
 			}
 			return errors.Wrap(err, "reload blocks")
 		}
-		if (uid == ulid.ULID{}) {
+
+		if (uid1 == ulid.ULID{}) {
 			// Compaction resulted in an empty block.
 			// Head truncating during db.reload() depends on the persisted blocks and
 			// in this case no new block will be persisted so manually truncate the head.
-			if err = db.head.Truncate(maxt); err != nil {
+			if err = db.Time_head1.Truncate(maxt1); err != nil {
+				return errors.Wrap(err, "head truncate failed (in compact)")
+			}
+		}
+		if (uid2 == ulid.ULID{}) {
+			// Compaction resulted in an empty block.
+			// Head truncating during db.reload() depends on the persisted blocks and
+			// in this case no new block will be persisted so manually truncate the head.
+			if err = db.Time_head2.Truncate(maxt2); err != nil {
+				return errors.Wrap(err, "head truncate failed (in compact)")
+			}
+		}
+		if (uid3 == ulid.ULID{}) {
+			// Compaction resulted in an empty block.
+			// Head truncating during db.reload() depends on the persisted blocks and
+			// in this case no new block will be persisted so manually truncate the head.
+			if err = db.Time_head3.Truncate(maxt3); err != nil {
+				return errors.Wrap(err, "head truncate failed (in compact)")
+			}
+		}
+		if (uid4 == ulid.ULID{}) {
+			// Compaction resulted in an empty block.
+			// Head truncating during db.reload() depends on the persisted blocks and
+			// in this case no new block will be persisted so manually truncate the head.
+			if err = db.Time_head4.Truncate(maxt4); err != nil {
 				return errors.Wrap(err, "head truncate failed (in compact)")
 			}
 		}
@@ -835,7 +1080,44 @@ func (db *DB) reload() (err error) {
 
 	maxt := loadable[len(loadable)-1].Meta().MaxTime
 
-	return errors.Wrap(db.head.Truncate(maxt), "head truncate failed")
+	var wg_time_head1_4 sync.WaitGroup
+	wg_time_head1_4.Add(4)
+	go func() {
+		err = db.Time_head1.Truncate(maxt)
+		if err != nil {
+			println(err, "time head 1 truncate failed")
+		}
+		wg_time_head1_4.Done()
+	}()
+
+	go func() {
+		err = db.Time_head2.Truncate(maxt + 30*60*1000)
+		if err != nil {
+			println(err, "time head 2 truncate failed")
+		}
+		wg_time_head1_4.Done()
+	}()
+
+	go func() {
+		err = db.Time_head3.Truncate(maxt + 30*60*1000*2)
+		if err != nil {
+			println(err, "time head 3 truncate failed")
+		}
+
+		wg_time_head1_4.Done()
+	}()
+
+	go func() {
+		err = db.Time_head4.Truncate(maxt + 30*60*1000*3)
+		if err != nil {
+			println(err, "time head 4 truncate failed")
+		}
+		wg_time_head1_4.Done()
+	}()
+
+	wg_time_head1_4.Wait()
+
+	return nil
 }
 
 func openBlocks(l log.Logger, dir string, loaded []*Block, chunkPool chunkenc.Pool) (blocks []*Block, corrupted map[ulid.ULID]error, err error) {
@@ -1085,8 +1367,12 @@ func (db *DB) Blocks() []*Block {
 }
 
 // Head returns the databases's head.
-func (db *DB) Head() *Head {
-	return db.head
+func (db *DB) Time_head() (*Head, *Head, *Head, *Head) {
+	return db.Time_head1, db.Time_head2, db.Time_head3, db.Time_head4
+}
+
+func (db *DB) TS_head() (*Head, *Head, *Head, *Head) {
+	return db.TS_head1, db.TS_head2, db.TS_head3, db.TS_head4
 }
 
 // Close the partition.
@@ -1112,7 +1398,14 @@ func (db *DB) Close() error {
 	if db.lockf != nil {
 		merr.Add(db.lockf.Release())
 	}
-	merr.Add(db.head.Close())
+	merr.Add(db.Time_head1.Close())
+	merr.Add(db.Time_head2.Close())
+	merr.Add(db.Time_head3.Close())
+	merr.Add(db.Time_head4.Close())
+	merr.Add(db.TS_head1.Close())
+	merr.Add(db.TS_head2.Close())
+	merr.Add(db.TS_head3.Close())
+	merr.Add(db.TS_head4.Close())
 	return merr.Err()
 }
 
@@ -1136,7 +1429,7 @@ func (db *DB) EnableCompactions() {
 
 // Snapshot writes the current data to the directory. If withHead is set to true it
 // will create a new block containing all data that's currently in the memory buffer/WAL.
-func (db *DB) Snapshot(dir string, withHead bool) error {
+/*func (db *DB) Snapshot(dir string, withHead bool) error {
 	if dir == db.dir {
 		return errors.Errorf("cannot snapshot into base directory")
 	}
@@ -1175,17 +1468,18 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 	}
 	return nil
 }
+*/
 
 // Querier returns a new querier over the data partition for the given time range.
 // A goroutine must not handle more than one open Querier.
-func (db *DB) Querier(mint, maxt int64) (Querier, error) {
+/*func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	var blocks []BlockReader
 	var blockMetas []BlockMeta
 
 	db.mtx.RLock()
 	defer db.mtx.RUnlock()
 
-	// 找出符合时间段的 block (not sure)
+	// 找出符合时间段的 block
 	for _, b := range db.blocks {
 		if b.OverlapsClosedInterval(mint, maxt) {
 			blocks = append(blocks, b)
@@ -1227,7 +1521,7 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	return &querier{
 		blocks: blockQueriers,
 	}, nil
-}
+}*/
 
 func rangeForTimestamp(t int64, width int64) (maxt int64) {
 	return (t/width)*width + width
@@ -1235,7 +1529,7 @@ func rangeForTimestamp(t int64, width int64) (maxt int64) {
 
 // Delete implements deletion of metrics. It only has atomicity guarantees on a per-block basis.
 // 这边实际会将 Delete 操作分给各个受影响的 Block
-func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
+/*func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
@@ -1255,7 +1549,7 @@ func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 		return db.head.Delete(mint, maxt, ms...)
 	})
 	return g.Wait()
-}
+}*/
 
 // CleanTombstones re-writes any blocks with tombstones.
 func (db *DB) CleanTombstones() (err error) {
