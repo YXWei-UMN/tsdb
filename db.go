@@ -983,6 +983,9 @@ func (db *DB) reload() (err error) {
 	sort.Slice(loadable, func(i, j int) bool {
 		return loadable[i].Meta().MinTime < loadable[j].Meta().MinTime
 	})
+
+	//TODO motivation实验 没有TS group 概念 所以必须要compact这些overlapping block = should allow overlapping blocks
+	//TODO solution evalution, 有TS group 概念，只在TS group 内部做compaction， 没有overlapping， 所以那时候可以选择 disallow overlapping block （or allow doesnt matter）. TS group based management 相比直接cut TS based on hash 少了 compaction on overlapping blocks
 	if !db.opts.AllowOverlappingBlocks {
 		if err := validateBlockSequence(loadable); err != nil {
 			return errors.Wrap(err, "invalid block sequence")

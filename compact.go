@@ -842,9 +842,6 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 		}
 
-		//后续开始update各种共享数据 所以需要lock
-		c.mtx.Lock()
-
 		//简单看了 chunks.go 里实现的WriteChunks, 应该就是把属于一个series的多个chunk写一起
 		//官方的话是：serializes a time block of chunked series data
 		if err := chunkw.WriteChunks(mergedChks...); err != nil {
@@ -877,8 +874,6 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 			valset.set(l.Value)
 		}
-		c.mtx.Unlock()
-		//这里自己有锁了
 		postings.Add(i, lset)
 
 		i++
