@@ -486,7 +486,6 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	meta.Compaction.Level = 1
 	meta.Compaction.Sources = []ulid.ULID{uid}
 
-	//Write似乎就是flush， compact 有另外的函数， 对于flush 没有parent 所以这一步似乎冗余
 	if parent != nil {
 		meta.Compaction.Parents = []BlockDesc{
 			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
@@ -842,9 +841,6 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 		}
 
-		//后续开始update各种共享数据 所以需要lock
-		c.mtx.Lock()
-
 		//简单看了 chunks.go 里实现的WriteChunks, 应该就是把属于一个series的多个chunk写一起
 		//官方的话是：serializes a time block of chunked series data
 		if err := chunkw.WriteChunks(mergedChks...); err != nil {
@@ -877,8 +873,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 			valset.set(l.Value)
 		}
-		c.mtx.Unlock()
-		//这里自己有锁了
+
 		postings.Add(i, lset)
 
 		i++
