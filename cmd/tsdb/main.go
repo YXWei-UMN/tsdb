@@ -187,6 +187,10 @@ func (b *writeBenchmark) run() error {
 
 	var labels []labels.Labels
 
+	/*println("before, go processor = ", runtime.GOMAXPROCS(0))
+	runtime.GOMAXPROCS(40)
+	println("after, go processor = ", runtime.GOMAXPROCS(0))*/
+
 	_, err = measureTime("readData", func() error {
 		f, err := os.Open(b.samplesFile)
 		if err != nil {
@@ -339,41 +343,98 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 		ts += timeDelta
 
 		//time based  0.5 hr = 30*60*1000 millisecond
-		var app = b.storage.Appender_time1()
-		head_id := (ts/(30*60*1000))%4 + 1
-
-		if head_id == 1 {
-			//do nothing
-		} else if head_id == 2 {
-			app = b.storage.Appender_time2()
-		} else if head_id == 3 {
-			app = b.storage.Appender_time3()
-		} else if head_id == 4 {
-			app = b.storage.Appender_time4()
-		}
+		var app1 = b.storage.Appender_ts1()
+		var app2 = b.storage.Appender_ts2()
+		var app3 = b.storage.Appender_ts3()
+		var app4 = b.storage.Appender_ts4()
 
 		for _, s := range scrape {
 			s.value += 1000
-
+			app_id := s.labels.Hash() % 4
 			//往 appender里 加一个sample <labels, timestamp, value>
 			if s.ref == nil {
 				//该time series 已经存在
-				ref, err := app.Add(s.labels, ts, float64(s.value))
-				if err != nil {
-					panic(err)
+				if app_id == 0 {
+					ref, err := app1.Add(s.labels, ts, float64(s.value))
+					if err != nil {
+						panic(err)
+					}
+					s.ref = &ref
+				} else if app_id == 1 {
+					ref, err := app2.Add(s.labels, ts, float64(s.value))
+					if err != nil {
+						panic(err)
+					}
+					s.ref = &ref
+				} else if app_id == 2 {
+					ref, err := app3.Add(s.labels, ts, float64(s.value))
+					if err != nil {
+						panic(err)
+					}
+					s.ref = &ref
+				} else if app_id == 3 {
+					ref, err := app4.Add(s.labels, ts, float64(s.value))
+					if err != nil {
+						panic(err)
+					}
+					s.ref = &ref
 				}
-				s.ref = &ref
-			} else if err := app.AddFast(*s.ref, ts, float64(s.value)); err != nil {
 
-				if errors.Cause(err) != tsdb.ErrNotFound {
-					panic(err)
+			} else {
+				if app_id == 0 {
+					if err := app1.AddFast(*s.ref, ts, float64(s.value)); err != nil {
+
+						if errors.Cause(err) != tsdb.ErrNotFound {
+							panic(err)
+						}
+
+						ref, err := app1.Add(s.labels, ts, float64(s.value))
+						if err != nil {
+							panic(err)
+						}
+						s.ref = &ref
+					}
+				} else if app_id == 1 {
+					if err := app2.AddFast(*s.ref, ts, float64(s.value)); err != nil {
+
+						if errors.Cause(err) != tsdb.ErrNotFound {
+							panic(err)
+						}
+
+						ref, err := app2.Add(s.labels, ts, float64(s.value))
+						if err != nil {
+							panic(err)
+						}
+						s.ref = &ref
+					}
+				} else if app_id == 2 {
+					if err := app3.AddFast(*s.ref, ts, float64(s.value)); err != nil {
+
+						if errors.Cause(err) != tsdb.ErrNotFound {
+							panic(err)
+						}
+
+						ref, err := app3.Add(s.labels, ts, float64(s.value))
+						if err != nil {
+							panic(err)
+						}
+						s.ref = &ref
+					}
+				} else if app_id == 3 {
+					if err := app4.AddFast(*s.ref, ts, float64(s.value)); err != nil {
+
+						if errors.Cause(err) != tsdb.ErrNotFound {
+							panic(err)
+						}
+
+						ref, err := app4.Add(s.labels, ts, float64(s.value))
+						if err != nil {
+							panic(err)
+						}
+						s.ref = &ref
+					}
 				}
 
-				ref, err := app.Add(s.labels, ts, float64(s.value))
-				if err != nil {
-					panic(err)
-				}
-				s.ref = &ref
 			}
 			//又插入了一个samples
 			total++
@@ -382,7 +443,16 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 		// 因为理论上需要先commit到WAL 才可以显示在memseries里，可能为了性能， 每次batch一定量的（scrape count*1000 TS）的samples 再一次commit到WAL
 		//为什么增加scrape count 会 out of bound？  猜测可能是appender的临时空间不够了或者out of order 或者超越time range了？ 总之现在不需要增加每个batch 的 scrape count
 
-		if err := app.Commit(); err != nil {
+		if err := app1.Commit(); err != nil {
+			return total, err
+		}
+		if err := app2.Commit(); err != nil {
+			return total, err
+		}
+		if err := app3.Commit(); err != nil {
+			return total, err
+		}
+		if err := app4.Commit(); err != nil {
 			return total, err
 		}
 	}
