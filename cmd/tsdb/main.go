@@ -223,12 +223,14 @@ func (b *writeBenchmark) run() error {
 	fmt.Println(" > samples/sec:", float64(total)/dur.Seconds())
 
 	_, err = measureTime("stopStorage", func() error {
-		if err := b.storage.Close(); err != nil {
-			return err
-		}
 		if err := b.stopProfiling(); err != nil {
 			return err
 		}
+		println("stop Profiling")
+		if err := b.storage.Close(); err != nil {
+			return err
+		}
+		println("storage closed")
 		return nil
 	})
 	if err != nil {
