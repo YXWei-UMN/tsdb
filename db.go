@@ -734,7 +734,7 @@ func (db *DB) compact() (err error) {
 		wg_ts_head1_4.Add(4)
 		go func() {
 			//runtime.LockOSThread()
-			fmt.Println("head 1", C.pthread_self())
+			//fmt.Println("head 1", C.pthread_self())
 			ts_head1 := &rangeHead{
 				head: db.TS_head1,
 				mint: mint,
@@ -758,7 +758,7 @@ func (db *DB) compact() (err error) {
 		//head2
 		go func() {
 			//runtime.LockOSThread()
-			fmt.Println("head 2", C.pthread_self())
+			//fmt.Println("head 2", C.pthread_self())
 			ts_head2 := &rangeHead{
 				head: db.TS_head2,
 				mint: mint,
@@ -781,7 +781,7 @@ func (db *DB) compact() (err error) {
 		//head3
 		go func() {
 			//runtime.LockOSThread()
-			fmt.Println("head 3", C.pthread_self())
+			//fmt.Println("head 3", C.pthread_self())
 			ts_head3 := &rangeHead{
 				head: db.TS_head3,
 				mint: mint,
@@ -804,7 +804,7 @@ func (db *DB) compact() (err error) {
 		//head4
 		go func() {
 			//runtime.LockOSThread()
-			fmt.Println("head 4", C.pthread_self())
+			//fmt.Println("head 4", C.pthread_self())
 			ts_head4 := &rangeHead{
 				head: db.TS_head4,
 				mint: mint,
