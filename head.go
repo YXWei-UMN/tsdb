@@ -596,9 +596,9 @@ func (h *Head) Truncate(mint int64) (err error) {
 
 	h.gc()
 	h.metrics.gcDuration.Observe(time.Since(start).Seconds())
-	h.metrics.gcduration = h.metrics.gcduration + uint64(time.Since(start)/1e6)
+	//h.metrics.gcduration = h.metrics.gcduration + uint64(time.Since(start)/1e6)
 	level.Info(h.logger).Log("msg", "head GC completed", "duration", time.Since(start))
-	println("total head GC duration (millisecond)", h.metrics.gcduration)
+	//println("total head GC duration (millisecond)", h.metrics.gcduration)
 
 	if h.wal == nil {
 		return nil
@@ -670,12 +670,12 @@ func (h *Head) Truncate(mint int64) (err error) {
 	}
 
 	h.metrics.walTruncateDuration.Observe(time.Since(start).Seconds())
-	h.metrics.WALcheckpoint_duration = h.metrics.WALcheckpoint_duration + uint64(time.Since(start)/1e6)
+	//h.metrics.WALcheckpoint_duration = h.metrics.WALcheckpoint_duration + uint64(time.Since(start)/1e6)
 
 	level.Info(h.logger).Log("msg", "WAL checkpoint complete",
 		"first", first, "last", last, "duration", time.Since(start))
 
-	println("total WAL checkpoint duration (millisecond)", h.metrics.WALcheckpoint_duration)
+	//println("total WAL checkpoint duration (millisecond)", h.metrics.WALcheckpoint_duration)
 
 	return nil
 }

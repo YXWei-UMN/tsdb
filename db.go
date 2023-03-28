@@ -175,6 +175,8 @@ type dbMetrics struct {
 	blocksBytes          prometheus.Gauge
 	maxBytes             prometheus.Gauge
 	sizeRetentionCount   prometheus.Counter
+	write_block_duration uint64
+	gcduration           uint64
 }
 
 func newDBMetrics(db *DB, r prometheus.Registerer) *dbMetrics {
@@ -788,6 +790,8 @@ func (db *DB) compact() (err error) {
 		var uid1, uid2, uid3, uid4 ulid.ULID
 		var err1, err2, err3, err4 error
 		var maxt1, maxt2, maxt3, maxt4 int64
+
+		start := time.Now()
 		//head1
 		var wg_time_head1_4 sync.WaitGroup
 		wg_time_head1_4.Add(4)
@@ -884,6 +888,9 @@ func (db *DB) compact() (err error) {
 		}()
 
 		wg_time_head1_4.Wait()
+		db.metrics.write_block_duration = db.metrics.write_block_duration + uint64(time.Since(start)/1e6)
+		println("total write block duratioin (millisecond)", db.metrics.write_block_duration)
+
 		runtime.GC()
 
 		//reload 在这里应该是重新清理一遍head里对block的认知 因为有新block写入 同时head里也需要GC truncate 老head
@@ -1079,7 +1086,7 @@ func (db *DB) reload() (err error) {
 	}
 
 	maxt := loadable[len(loadable)-1].Meta().MaxTime
-
+	start := time.Now()
 	var wg_time_head1_4 sync.WaitGroup
 	wg_time_head1_4.Add(4)
 	go func() {
@@ -1116,6 +1123,8 @@ func (db *DB) reload() (err error) {
 	}()
 
 	wg_time_head1_4.Wait()
+	db.metrics.gcduration = db.metrics.gcduration + uint64(time.Since(start)/1e6)
+	println("total GC duration include memory reclaim & WAL checkpoint (millisecond)", db.metrics.gcduration)
 
 	return nil
 }

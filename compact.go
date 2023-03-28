@@ -509,9 +509,6 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 		"duration", time.Since(start),
 	)
 
-	c.metrics.write_block_duration = c.metrics.write_block_duration + uint64(time.Since(start)/1e6)
-	println("total write block duratioin (millisecond)", c.metrics.write_block_duration)
-
 	return uid, nil
 }
 
