@@ -529,7 +529,7 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 	}
 
 	//TODO run 方法在 Open 时被调用, 在一个单独的 goroutine 中执行, 主要是定期对数据进行compaction
-	go db.run()
+	//go db.run()
 
 	return db, nil
 }
@@ -595,11 +595,11 @@ func (a dbAppender) Commit() error {
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
-	if a.db.head.compactable() {
-		/*select {
-		case a.db.compactc <- struct{}{}:
-		default:
-		}*/
+	/*if a.db.head.compactable() {
+		//select {
+		//case a.db.compactc <- struct{}{}:
+		//default:
+		//}
 
 		a.db.metrics.compactionsTriggered.Inc()
 		//a.db.DisableCompactions()
@@ -615,7 +615,7 @@ func (a dbAppender) Commit() error {
 			a.db.metrics.compactionsSkipped.Inc()
 		}
 		a.db.autoCompactMtx.Unlock()
-	}
+	}*/
 	return err
 }
 

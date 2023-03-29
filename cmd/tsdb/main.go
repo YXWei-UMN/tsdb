@@ -179,7 +179,7 @@ func (b *writeBenchmark) run() error {
 		//WALSegmentSize:    -1,
 		RetentionDuration: 32 * 60 * 60 * 1000, // 32 hrs in milliseconds
 		// time range of a block expands from 2hrs -> 4 hrs -> 8 hrs -> 16 hrs -> 32 hrs
-		BlockRanges: tsdb.ExponentialBlockRanges(30*60*1000, 6, 2), // from stepsize 3 -> 2
+		BlockRanges: tsdb.ExponentialBlockRanges(2*60*60*1000, 5, 3), // from stepsize 3 -> 2
 	})
 	if err != nil {
 		return err
@@ -210,7 +210,7 @@ func (b *writeBenchmark) run() error {
 
 	dur, err := measureTime("ingestScrapes", func() error {
 		b.startProfiling()
-		total, err = b.ingestScrapes(labels, 46080) // 10s sampling interval, 通过改变 scrape count 来 增大采样时间, 46080 = 128 hrs
+		total, err = b.ingestScrapes(labels, 720) // 10s sampling interval, 720 = 2 hrs
 		if err != nil {
 			return err
 		}
@@ -258,58 +258,59 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 	var total_in_last_tick uint64
 	total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
 	last_time := time.Now()
-
-	for i := 0; i < scrapeCount; i += 100 {
-		var wg sync.WaitGroup
-		lbls := lbls
-		//每次插入1000 ts 的 100 samples  （每个sample 一个周期， 1000 ts的 1000sample 为一个batch， 每个go func 执行100个batch）
-		// 直接记录每1000*100 个sample的执行时间？ 不行 因为每1000*100的sample插入是高并发的 所以还是需要在外面每隔period of time 来overall的计算throughput
-		for len(lbls) > 0 {
-			l := 1000
-			if len(lbls) < 1000 {
-				l = len(lbls)
-			}
-			batch := lbls[:l]
-			lbls = lbls[l:]
-			wg.Add(1)
-			// 默认开启 TS/1000 个协程 并发插入， 可以通过改变 l:= 1xxx  来增加/减少协程数
-			go func() {
-				//start := time.Now()
-				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
-				//duration := int64(time.Since(start) / 1e6)
-				//s_duration := strconv.FormatInt(duration, 10)
-				//write.WriteString(s_duration + "\n")
-
-				if err != nil {
-					// exitWithError(err)
-					fmt.Println(" err", err)
+	total_duration := uint64(0)
+	select {
+	case <-ticker.C:
+		last_time = time.Now()
+		// 每十秒feed每个TS一个data
+		for i := 0; i < scrapeCount; i++ {
+			var wg sync.WaitGroup
+			lbls := lbls
+			//每10k ts 一个goroutine, 100M TS 共 10K goroutine
+			for len(lbls) > 0 {
+				l := 10000
+				if len(lbls) < 10000 {
+					l = len(lbls)
 				}
-				mu.Lock()
-				total += n
-				mu.Unlock()
-				wg.Done()
-			}()
+				batch := lbls[:l]
+				lbls = lbls[l:]
+				wg.Add(1)
+				go func() {
+					//start := time.Now()
+					n, err := b.ingestScrapesShard(batch, 1, int64(timeDelta*i))
+					//duration := int64(time.Since(start) / 1e6)
+					//s_duration := strconv.FormatInt(duration, 10)
+					//write.WriteString(s_duration + "\n")
+
+					if err != nil {
+						// exitWithError(err)
+						fmt.Println(" err", err)
+					}
+					mu.Lock()
+					total += n
+					mu.Unlock()
+					wg.Done()
+				}()
+			}
+			wg.Wait()
 		}
-		wg.Wait()
 
-		select {
-		case t := <-ticker.C:
-			duration := uint64(time.Since(last_time) / 1e9)
-			new_insert_sample_num := total - total_in_last_tick
-			throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
-			//格式化写入
-			s_throughput := strconv.FormatUint(throughput, 10)
-			write.WriteString(s_throughput + "\n")
+		duration := uint64(time.Since(last_time) / 1e9)
+		total_duration += duration
+		new_insert_sample_num := total - total_in_last_tick
+		throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
+		//格式化写入
+		s_throughput := strconv.FormatUint(throughput, 10)
+		s_totalduration := strconv.FormatUint(total_duration, 10)
+		write.WriteString(s_totalduration + " " + s_throughput + "\n")
 
-			//更新last time 和 last total
-			last_time = t
-			total_in_last_tick = total
-		default:
-		}
-
-		//Flush将缓存的文件真正写入到文件中
-		write.Flush()
+		//更新last total
+		total_in_last_tick = total
+	default:
 	}
+
+	//Flush将缓存的文件真正写入到文件中
+	write.Flush()
 	fmt.Println("ingestion completed")
 
 	return total, nil
