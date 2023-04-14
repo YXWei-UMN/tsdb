@@ -467,7 +467,7 @@ func TestHeadDeleteSimple(t *testing.T) {
 					testutil.Equals(t, c.smplsExp, actSamples)
 				}
 
-				// Compare the query results for both heads - before and after the reload.
+				// Compare the query_bench results for both heads - before and after the reload.
 				expSeriesSet := newMockSeriesSet([]Series{
 					newSeries(map[string]string{lblDefault.Name: lblDefault.Value}, func() []tsdbutil.Sample {
 						ss := make([]tsdbutil.Sample, 0, len(c.smplsExp))

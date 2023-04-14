@@ -124,7 +124,7 @@ func TestMergedSeriesSet(t *testing.T) {
 					sample{t: 2, v: 1},
 				}),
 				newSeries(map[string]string{
-					"handler":  "query",
+					"handler":  "query_bench",
 					"instance": "localhost:9090",
 				}, []tsdbutil.Sample{
 					sample{t: 2, v: 2},
@@ -145,7 +145,7 @@ func TestMergedSeriesSet(t *testing.T) {
 					sample{t: 1, v: 2},
 				}),
 				newSeries(map[string]string{
-					"handler":  "query",
+					"handler":  "query_bench",
 					"instance": "localhost:9090",
 				}, []tsdbutil.Sample{
 					sample{t: 2, v: 2},

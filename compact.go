@@ -453,7 +453,7 @@ func (c *LeveledCompactor) Compact(dest string, dirs []string, open []*Block) (u
 		}
 
 		c.metrics.compact_block_duration = c.metrics.compact_block_duration + uint64(time.Since(start)/1e6)
-		println("total compaction duration (millisecond)", c.metrics.compact_block_duration)
+		fmt.Println("total compaction duration (millisecond)", c.metrics.compact_block_duration)
 		return uid, nil
 	}
 
@@ -508,7 +508,7 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
 	)
 
 	c.metrics.write_block_duration = c.metrics.write_block_duration + uint64(time.Since(start)/1e6)
-	println("total write block duratioin (millisecond)", c.metrics.write_block_duration)
+	fmt.Println("total write block duratioin (millisecond)", c.metrics.write_block_duration)
 
 	return uid, nil
 }

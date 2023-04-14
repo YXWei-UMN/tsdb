@@ -79,7 +79,7 @@ type Options struct {
 	NoLockfile bool
 
 	// Overlapping blocks are allowed if AllowOverlappingBlocks is true.
-	// This in-turn enables vertical compaction and vertical query merge.
+	// This in-turn enables vertical compaction and vertical query_bench merge.
 	AllowOverlappingBlocks bool
 
 	// WALCompression will turn on Snappy compression for records on the WAL.
@@ -595,7 +595,7 @@ func (a dbAppender) Commit() error {
 
 	// We could just run this check every few minutes practically. But for benchmarks
 	// and high frequency use cases this is the safer way.
-	/*if a.db.head.compactable() {
+	if a.db.head.compactable() {
 		//select {
 		//case a.db.compactc <- struct{}{}:
 		//default:
@@ -615,7 +615,7 @@ func (a dbAppender) Commit() error {
 			a.db.metrics.compactionsSkipped.Inc()
 		}
 		a.db.autoCompactMtx.Unlock()
-	}*/
+	}
 	return err
 }
 
@@ -686,6 +686,11 @@ func (db *DB) compact() (err error) {
 
 	// Check for compactions of multiple blocks.
 	for {
+		//when TS number > 16M, too many go routine will stall in this for loop waiting for compaction, thus add a break here
+		if !db.head.compactable() { //如果这个head的时间超过了既定range的3/2 就是compactable
+			break
+		}
+
 		plan, err := db.compactor.Plan(db.dir)
 		if err != nil {
 			return errors.Wrap(err, "plan compaction")
@@ -1167,6 +1172,7 @@ func (db *DB) Snapshot(dir string, withHead bool) error {
 
 // Querier returns a new querier over the data partition for the given time range.
 // A goroutine must not handle more than one open Querier.
+
 func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	var blocks []BlockReader
 	var blockMetas []BlockMeta
@@ -1174,7 +1180,7 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	db.mtx.RLock()
 	defer db.mtx.RUnlock()
 
-	// 找出符合时间段的 block (not sure)
+	// 找出符合时间段的 block
 	for _, b := range db.blocks {
 		if b.OverlapsClosedInterval(mint, maxt) {
 			blocks = append(blocks, b)
@@ -1184,14 +1190,16 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 
 	// Head 可以视作当前 Block
 	if maxt >= db.head.MinTime() {
+		fmt.Println("query includes head as a time slice")
 		blocks = append(blocks, &rangeHead{
 			head: db.head,
-			mint: mint,
+			mint: db.head.MinTime(),
 			maxt: maxt,
 		})
 	}
 
 	blockQueriers := make([]Querier, 0, len(blocks))
+	fmt.Println("query go accross ", len(blocks), " time slice")
 	for _, b := range blocks {
 		q, err := NewBlockQuerier(b, mint, maxt)
 		if err == nil {
@@ -1206,6 +1214,7 @@ func (db *DB) Querier(mint, maxt int64) (Querier, error) {
 	}
 
 	if len(OverlappingBlocks(blockMetas)) > 0 {
+		println("in db.Querier, exist overlapping blocks, generate verticalQuerier (may have same problems we solved already in normal queriers)")
 		return &verticalQuerier{
 			querier: querier{
 				blocks: blockQueriers,

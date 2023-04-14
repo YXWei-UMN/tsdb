@@ -52,6 +52,7 @@ func openTestDB(t testing.TB, opts *Options) (db *DB, close func()) {
 }
 
 // query runs a matcher query against the querier and fully expands its data.
+// TODO figure out matcher so that we can bench query,  add measuretime to measure throughput
 func query(t testing.TB, q Querier, matchers ...labels.Matcher) map[string][]tsdbutil.Sample {
 	ss, err := q.Select(matchers...)
 	defer func() {
@@ -1431,10 +1432,10 @@ func TestQuerierWithBoundaryChunks(t *testing.T) {
 }
 
 // TestInitializeHeadTimestamp ensures that the h.minTime is set properly.
-// 	- no blocks no WAL: set to the time of the first  appended sample
-// 	- no blocks with WAL: set to the smallest sample from the WAL
-//	- with blocks no WAL: set to the last block maxT
-// 	- with blocks with WAL: same as above
+//   - no blocks no WAL: set to the time of the first  appended sample
+//   - no blocks with WAL: set to the smallest sample from the WAL
+//   - with blocks no WAL: set to the last block maxT
+//   - with blocks with WAL: same as above
 func TestInitializeHeadTimestamp(t *testing.T) {
 	t.Run("clean", func(t *testing.T) {
 		dir, err := ioutil.TempDir("", "test_head_init")
@@ -2156,10 +2157,12 @@ func TestVerticalCompaction(t *testing.T) {
 }
 
 // TestBlockRanges checks the following use cases:
-//  - No samples can be added with timestamps lower than the last block maxt.
-//  - The compactor doesn't create overlapping blocks
+//   - No samples can be added with timestamps lower than the last block maxt.
+//   - The compactor doesn't create overlapping blocks
+//
 // even when the last blocks is not within the default boundaries.
-//	- Lower boundary is based on the smallest sample in the head and
+//   - Lower boundary is based on the smallest sample in the head and
+//
 // upper boundary is rounded to the configured block range.
 //
 // This ensures that a snapshot that includes the head and creates a block with a custom time range

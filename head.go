@@ -1190,6 +1190,7 @@ func (h *Head) MaxTime() int64 {
 // The 0.5 acts as a buffer of the appendable window.
 func (h *Head) compactable() bool {
 	return h.MaxTime()-h.MinTime() > h.chunkRange/2*3
+	//return h.MaxTime()-h.MinTime() > h.chunkRange*5
 }
 
 // Close flushes the WAL and closes the head.

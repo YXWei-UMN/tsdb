@@ -18,11 +18,14 @@ TSDB_BENCHMARK_NUM_METRICS ?= 2000000
 TSDB_BENCHMARK_DATASET ?= "$(TSDB_PROJECT_DIR)/testdata/TS_2.7M"
 #TSDB_BENCHMARK_OUTPUT_DIR ?= "$(TSDB_PROJECT_DIR)/benchout"
 TSDB_BENCHMARK_OUTPUT_DIR ?= "/mnt/tsdb/benchout"
+QUERY_BENCH_CLI_DIR="$(TSDB_PROJECT_DIR)/cmd/query_bench"
+QUERY_BENCH_BIN = "$(QUERY_BENCH_CLI_DIR)/query_bench"
 
 include Makefile.common
 
 build:
 	GO111MODULE=$(GO111MODULE) $(GO) build -o $(TSDB_BIN) $(TSDB_CLI_DIR)
+	#GO111MODULE=$(GO111MODULE) $(GO) build -o $(QUERY_BENCH_BIN) $(QUERY_BENCH_CLI_DIR)
 
 bench: build
 	@echo ">> running benchmark, writing result to $(TSDB_BENCHMARK_OUTPUT_DIR)"

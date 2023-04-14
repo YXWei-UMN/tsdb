@@ -72,7 +72,7 @@ func TestCompareAndEquals(t *testing.T) {
 				{"instance", "localhost:9090"},
 			},
 			b: []Label{
-				{"handler", "query"},
+				{"handler", "query_bench"},
 				{"instance", "localhost:9090"},
 			},
 			res: -1,

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/pkg/errors"
@@ -120,7 +121,8 @@ func (q *querier) sel(qs []Querier, ms []labels.Matcher) (SeriesSet, error) {
 		return EmptySeriesSet(), nil
 	}
 	if len(qs) == 1 {
-		return qs[0].Select(ms...)
+		ss, err := qs[0].Select(ms...)
+		return ss, err
 	}
 	l := len(qs) / 2
 
@@ -192,8 +194,10 @@ func NewBlockQuerier(b BlockReader, mint, maxt int64) (Querier, error) {
 		return nil, errors.Wrapf(err, "open tombstone reader")
 	}
 	return &blockQuerier{
-		mint:       mint,
-		maxt:       maxt,
+		//mint:       mint,
+		//maxt:       maxt,
+		mint:       b.Meta().MinTime,
+		maxt:       b.Meta().MaxTime,
 		index:      indexr,
 		chunks:     chunkr,
 		tombstones: tombsr,
@@ -212,10 +216,19 @@ type blockQuerier struct {
 }
 
 func (q *blockQuerier) Select(ms ...labels.Matcher) (SeriesSet, error) {
+	fmt.Println("select ------------------ block ", q.mint, "-", q.maxt, "--------------")
+	start_lookup := time.Now()
 	base, err := LookupChunkSeries(q.index, q.tombstones, ms...)
+	fmt.Println("--------------", time.Since(start_lookup).Microseconds(), "μs")
+
+	/*base.Next()
+	ls, _, _ := base.At()
+	println("Select ", ls.String())*/
+
 	if err != nil {
 		return nil, err
 	}
+
 	return &blockSeriesSet{
 		set: &populatedChunkSeries{
 			set:    base,
@@ -227,6 +240,29 @@ func (q *blockQuerier) Select(ms ...labels.Matcher) (SeriesSet, error) {
 		mint: q.mint,
 		maxt: q.maxt,
 	}, nil
+
+	/*bb := &blockSeriesSet{
+		set: &populatedChunkSeries{
+			set:    base,
+			chunks: q.chunks,
+			mint:   q.mint,
+			maxt:   q.maxt,
+		},
+
+		mint: q.mint,
+		maxt: q.maxt,
+	}
+
+	next := bb.Next()
+	if next {
+		se := bb.At()
+		println(se.Labels().String())
+		return bb, nil
+	} else {
+		println("no next")
+		return nil, err
+	}*/
+
 }
 
 func (q *blockQuerier) LabelValues(name string) ([]string, error) {
@@ -400,6 +436,7 @@ func postingsForMatcher(ix IndexReader, m labels.Matcher) (index.Postings, error
 
 	// Fast-path for equal matching.
 	if em, ok := m.(*labels.EqualMatcher); ok {
+		// checked, here works well for multiple matchers
 		return ix.Postings(em.Name(), em.Value())
 	}
 
@@ -693,7 +730,10 @@ func LookupChunkSeries(ir IndexReader, tr TombstoneReader, ms ...labels.Matcher)
 	if tr == nil {
 		tr = newMemTombstones()
 	}
+	//start_lookup := time.Now()
 	p, err := PostingsForMatchers(ir, ms...)
+	//println(">> PostingsForMatchers --------------------------------", time.Since(start_lookup).Microseconds(), "μs")
+
 	if err != nil {
 		return nil, err
 	}
@@ -826,7 +866,7 @@ func (s *populatedChunkSeries) Next() bool {
 	return false
 }
 
-// blockSeriesSet is a set of series from an inverted index query.
+// blockSeriesSet is a set of series from an inverted index query_bench.
 type blockSeriesSet struct {
 	set ChunkSeriesSet
 	err error

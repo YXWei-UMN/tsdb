@@ -16,9 +16,12 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/mem"
 	"io"
 	"io/ioutil"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,12 +70,23 @@ func execute() (err error) {
 		dumpPath             = dumpCmd.Arg("db path", "database path (default is "+defaultDBPath+")").Default(defaultDBPath).String()
 		dumpMinTime          = dumpCmd.Flag("min-time", "minimum timestamp to dump").Default(strconv.FormatInt(math.MinInt64, 10)).Int64()
 		dumpMaxTime          = dumpCmd.Flag("max-time", "maximum timestamp to dump").Default(strconv.FormatInt(math.MaxInt64, 10)).Int64()
+
+		benchQueryCmd = benchCmd.Command("query_bench", "run a query_bench performance benchmark")
 	)
 
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 	var merr tsdb_errors.MultiError
 
 	switch kingpin.MustParse(cli.Parse(os.Args[1:])) {
+	case benchQueryCmd.FullCommand():
+		println("run query_bench bench")
+		/*wb := &writeBenchmark{
+			outPath:     *benchWriteOutPath,
+			numMetrics:  *benchWriteNumMetrics,
+			samplesFile: *benchSamplesFile,
+			logger:      logger,
+		}
+		return wb.run()*/
 	case benchWriteCmd.FullCommand():
 		wb := &writeBenchmark{
 			outPath:     *benchWriteOutPath,
@@ -186,7 +200,31 @@ func (b *writeBenchmark) run() error {
 	}
 	b.storage = st
 
-	var labels []labels.Labels
+	var labelset []labels.Labels
+
+	//每隔一秒检查一次系统memory 余量 避免超出导致server shut down
+	go func() {
+		for {
+			memInfo, _ := mem.VirtualMemory()
+			if memInfo.Used/1024/1204/1204 > 115 {
+				println("mem used approach 120G, stop tsdb")
+				os.Exit(4)
+			}
+			var memStats runtime.MemStats
+			runtime.ReadMemStats(&memStats)
+			if memStats.Alloc/1024/1204/1204 > 115 {
+				println("memStats.Alloc approach 120G, stop tsdb")
+				os.Exit(4)
+			}
+
+			if memStats.Sys/1024/1204/1204 > 115 {
+				println("memStats.Sys approach 120G, stop tsdb")
+				os.Exit(4)
+			}
+
+			time.Sleep(time.Second)
+		}
+	}()
 
 	_, err = measureTime("readData", func() error {
 		f, err := os.Open(b.samplesFile)
@@ -196,7 +234,7 @@ func (b *writeBenchmark) run() error {
 		defer f.Close()
 
 		//read data samples to form labels
-		labels, err = readPrometheusLabels(f, b.numMetrics)
+		labelset, err = readPrometheusLabels(f, b.numMetrics)
 		if err != nil {
 			return err
 		}
@@ -210,7 +248,8 @@ func (b *writeBenchmark) run() error {
 
 	dur, err := measureTime("ingestScrapes", func() error {
 		b.startProfiling()
-		total, err = b.ingestScrapes(labels, 720) // 10s sampling interval, 720 = 2 hrs
+		total, err = b.ingestScrapes(labelset, 4320) // 10s sampling interval, 2 hrs = 720, 12 hrs = 4320,
+
 		if err != nil {
 			return err
 		}
@@ -223,11 +262,114 @@ func (b *writeBenchmark) run() error {
 	fmt.Println(" > total samples:", total)
 	fmt.Println(" > samples/sec:", float64(total)/dur.Seconds())
 
+	time.Sleep(time.Second * 5)
+
+	fmt.Println("--------------------- query bench ------------------------ ")
+	/*Metric_Matchers := []labels.Matcher{
+		labels.NewEqualMatcher("region", "cn-central-2"),
+		labels.NewEqualMatcher("region", "cn-central-1"),
+		labels.NewEqualMatcher("region", "cn-west-2"),
+		labels.NewEqualMatcher("region", "cn-west-1"),
+
+		labels.NewEqualMatcher("region", "cn-east-2"),
+		labels.NewEqualMatcher("region", "cn-east-1"),
+		labels.NewEqualMatcher("region", "us-east-1"),
+		labels.NewEqualMatcher("region", "us-east-2"),
+
+		labels.NewEqualMatcher("region", "us-west-1"),
+		labels.NewEqualMatcher("region", "us-west-2"),
+		labels.NewEqualMatcher("region", "eu-west-1"),
+		labels.NewEqualMatcher("region", "eu-central-1"),
+
+		labels.NewEqualMatcher("region", "ap-northeast-1"),
+		labels.NewEqualMatcher("region", "ap-northeast-2"),
+		labels.NewEqualMatcher("region", "ap-southeast-1"),
+		labels.NewEqualMatcher("region", "ap-southeast-2"),
+
+		labels.NewEqualMatcher("region", "ap-south-1"),
+		labels.NewEqualMatcher("region", "sa-east-1"),
+		labels.NewEqualMatcher("region", "ap-south-2"),
+		labels.NewEqualMatcher("region", "sa-east-2"),
+	}*/
+
+	Metric_Matchers := []labels.Matcher{
+		labels.NewEqualMatcher("region", "cn-central-2"),
+		labels.NewEqualMatcher("region", "cn-central-1"),
+		labels.NewEqualMatcher("region", "cn-west-2"),
+		labels.NewEqualMatcher("region", "cn-west-1"),
+		labels.NewEqualMatcher("region", "cn-east-2"),
+	}
+
+	/*host_matchers := []labels.Matcher{}
+	for i := 0; i < 50; i++ { //donest sure whether the host range has effect on query_bench, temporarily use rand % 10M
+		host_matchers = append(host_matchers, labels.NewEqualMatcher("host", strconv.Itoa(rand.Intn(b.numMetrics/len(Metric_Matchers)))))
+	}*/
+
+	host_matchers := []labels.Matcher{
+		labels.NewEqualMatcher("host", "1"),
+		labels.NewEqualMatcher("host", "10"),
+		labels.NewEqualMatcher("host", "20"),
+		labels.NewEqualMatcher("host", "30"),
+		labels.NewEqualMatcher("host", "40"),
+		labels.NewEqualMatcher("host", "50"),
+		labels.NewEqualMatcher("host", "60"),
+		labels.NewEqualMatcher("host", "70"),
+	}
+
+	starts := []int64{}
+	ends := []int64{}
+
+	for i := int64(0); i <= 10; i += 2 {
+		starts = append(starts, i*3600*1000)
+		ends = append(ends, (i+2)*3600*1000)
+	}
+
+	queryDuration, err := os.Create(filepath.Join(b.outPath, "query_bench_log"))
+	if err != nil {
+		fmt.Println(" err", err)
+	}
+	defer queryDuration.Close()
+	//写入文件时，使用带缓存的 *Writer
+	writer := bufio.NewWriter(queryDuration)
+
+	// 1 host 1 metric   recent data (2hr)
+	err = DBQuery111(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+	// 1 host 1 metric 	long term data (12hr)
+	err = DBQuery1112(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+
+	// 8 host 1 metric   recent data (2hr)
+	err = DBQuery181(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+	// 8 host 1 metric 	long term data (12hr)
+	err = DBQuery1812(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+
+	// 1 host 5 metric   recent data (2hr)
+	err = DBQuery511(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+	// 1 host 5 metric 	long term data (12hr)
+	err = DBQuery5112(b.storage, host_matchers, Metric_Matchers, starts, ends, writer)
+	if err != nil {
+		return err
+	}
+
 	_, err = measureTime("stopStorage", func() error {
-		if err := b.storage.Close(); err != nil {
+		if err := b.stopProfiling(); err != nil {
 			return err
 		}
-		if err := b.stopProfiling(); err != nil {
+		if err := b.storage.Close(); err != nil {
 			return err
 		}
 		return nil
@@ -242,11 +384,59 @@ func (b *writeBenchmark) run() error {
 // 单位是millisecond
 const timeDelta = 1e4
 
+func GetCpuPercent() float64 {
+	percent, _ := cpu.Percent(time.Second, false)
+	return percent[0]
+}
+
+func GetMemPercent() float64 {
+	memInfo, _ := mem.VirtualMemory()
+	return memInfo.UsedPercent
+}
+
+func bToGb(b uint64) uint64 {
+	return b / 1024 / 1024 / 1024
+}
+
 func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (uint64, error) {
 	var mu sync.Mutex
 	var total uint64
 
-	batchDuration, err := os.Create(filepath.Join(b.outPath, "batch.duration"))
+	for i := 0; i < scrapeCount; i += 100 {
+		var wg sync.WaitGroup
+		lbls := lbls
+		for len(lbls) > 0 {
+			l := 1000
+			if len(lbls) < 1000 {
+				l = len(lbls)
+			}
+			batch := lbls[:l]
+			lbls = lbls[l:]
+
+			wg.Add(1)
+			go func() {
+				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
+				if err != nil {
+					// exitWithError(err)
+					fmt.Println(" err", err)
+				}
+				mu.Lock()
+				total += n
+				mu.Unlock()
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+	}
+	fmt.Println("ingestion completed")
+
+	return total, nil
+}
+
+func (b *writeBenchmark) ingestScrapes_realtime(lbls []labels.Labels, scrapeCount int) (uint64, error) {
+	var total uint64
+
+	batchDuration, err := os.Create(filepath.Join(b.outPath, "write_log"))
 	if err != nil {
 		fmt.Println(" err", err)
 	}
@@ -254,18 +444,54 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 
 	//写入文件时，使用带缓存的 *Writer
 	write := bufio.NewWriter(batchDuration)
-	ticker := time.NewTicker(time.Second * 10) // 每10秒tick一次, ticker 似乎比timer 更精准  但都不是按秒准确计时的 Chanel的读取有波动
+	ticker := time.NewTicker(time.Second) // 每10秒tick一次
+	defer ticker.Stop()
+
 	var total_in_last_tick uint64
 	total_in_last_tick = 0 // 上一次tick 所累计插入的samples数目
-	last_time := time.Now()
-	total_duration := uint64(0)
-	select {
-	case <-ticker.C:
-		last_time = time.Now()
-		// 每十秒feed每个TS一个data
-		for i := 0; i < scrapeCount; i++ {
+	start := time.Now()
+
+	var ch = make(chan int, scrapeCount)
+	cherrors := make(chan error)
+	go func() {
+		for j := 0; j < scrapeCount; j++ {
+			select {
+			// 每十秒feed每个TS一个data
+			case <-ticker.C:
+				ch <- j
+				println("write ", j, "into channel, channel now has ", len(ch), " tickers.")
+			}
+		}
+
+	}()
+
+	for true {
+		select {
+		case err := <-cherrors:
+			close(cherrors)
+			return total, err
+		case i := <-ch:
+			t := time.Now()
+
+			if i == scrapeCount {
+				fmt.Println("ingestion completed")
+				return total, nil
+			}
+
+			if i == 0 {
+				start = time.Now()
+				t_process_next_batch_of_data_at := strconv.FormatUint(uint64(time.Since(start)/1e9), 10)
+				write.WriteString("processing the first batch of data at " + t_process_next_batch_of_data_at + "s \n")
+			} else {
+				t_process_next_batch_of_data_at := strconv.FormatUint(uint64(time.Since(start)/1e9), 10)
+				write.WriteString("processing next batch of data at " + t_process_next_batch_of_data_at + "s \n")
+			}
+
+			//fmt.Println("before insert, CPU - ", GetCpuPercent())
+			//fmt.Println("before insert, mem - ", GetMemPercent())
 			var wg sync.WaitGroup
 			lbls := lbls
+			total += uint64(len(lbls))
 			//每10k ts 一个goroutine, 100M TS 共 10K goroutine
 			for len(lbls) > 0 {
 				l := 10000
@@ -276,8 +502,9 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 				lbls = lbls[l:]
 				wg.Add(1)
 				go func() {
+					//fmt.Println("parallel insert, CPU - ", GetCpuPercent())
 					//start := time.Now()
-					n, err := b.ingestScrapesShard(batch, 1, int64(timeDelta*i))
+					_, err := b.ingestScrapesShard(batch, 1, int64(time.Since(start)/1e6))
 					//duration := int64(time.Since(start) / 1e6)
 					//s_duration := strconv.FormatInt(duration, 10)
 					//write.WriteString(s_duration + "\n")
@@ -286,33 +513,44 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 						// exitWithError(err)
 						fmt.Println(" err", err)
 					}
-					mu.Lock()
-					total += n
-					mu.Unlock()
 					wg.Done()
 				}()
+				//write.WriteString("passed " + strconv.FormatUint(uint64(time.Since(start)/1e9), 10) + "s, we record the time passed every 10K TS because we cant even iterate all TS once\n")
 			}
 			wg.Wait()
+
+			// time since last time data is feed ()
+			duration_overall := uint64(time.Since(start) / 1e6)
+			// insert time when data is receiving
+			duration_ingest := uint64(time.Since(t) / 1e6)
+			// above two time can be identical when data coming rate = data ingest rate
+
+			new_insert_sample_num := total - total_in_last_tick
+			throughput_ingest := new_insert_sample_num / duration_ingest * 1000
+			throughput_overall := total / duration_overall * 1000 //现在的throughput是 samples/second
+
+			write.WriteString("duration_overall: " + strconv.FormatUint(duration_overall, 10) + "ms" + "  throughput " + strconv.FormatUint(throughput_overall, 10) + "/s \n")
+			write.WriteString("duration_ingest_batch" + strconv.FormatUint(uint64(i), 10) + ": " + strconv.FormatUint(duration_ingest, 10) + "ms" + "  throughput " + strconv.FormatUint(throughput_ingest, 10) + "/s \n")
+
+			memInfo, _ := mem.VirtualMemory()
+			write.WriteString("after insert batch " + strconv.FormatUint(uint64(i), 10) + " mem total-" + strconv.FormatUint(memInfo.Total/1024/1024/1024, 10) + "G  mem used-" + strconv.FormatUint(memInfo.Used/1024/1204/1204, 10) + "\n")
+
+			//格式化写入
+			/*s_throughput := strconv.FormatUint(throughput, 10)
+			s_totalduration := strconv.FormatUint(uint64(time.Since(start)/1e9), 10)
+			write.WriteString(s_totalduration + " " + s_throughput + "\n")
+			//Flush将缓存的文件真正写入到文件中
+			*/
+
+			//更新
+			total_in_last_tick = total
+			write.WriteString("passed " + strconv.FormatUint(uint64(time.Since(start)/1e9), 10) + "s, next batch of data is comint at " + strconv.FormatUint(uint64((i+1)*10), 10) + "s\n")
+			write.WriteString("-----------------------------------------------\n")
+			write.Flush()
 		}
 
-		duration := uint64(time.Since(last_time) / 1e9)
-		total_duration += duration
-		new_insert_sample_num := total - total_in_last_tick
-		throughput := new_insert_sample_num / duration //现在的throughput是 samples/second
-		//格式化写入
-		s_throughput := strconv.FormatUint(throughput, 10)
-		s_totalduration := strconv.FormatUint(total_duration, 10)
-		write.WriteString(s_totalduration + " " + s_throughput + "\n")
-
-		//更新last total
-		total_in_last_tick = total
-	default:
 	}
-
-	//Flush将缓存的文件真正写入到文件中
-	write.Flush()
 	fmt.Println("ingestion completed")
-
 	return total, nil
 }
 
@@ -345,7 +583,7 @@ func (b *writeBenchmark) ingestScrapesShard(lbls []labels.Labels, scrapeCount in
 
 			//往 appender里 加一个sample <labels, timestamp, value>
 			if s.ref == nil {
-				//该time series 已经存在
+				//该time series 不存在
 				ref, err := app.Add(s.labels, ts, float64(s.value))
 				if err != nil {
 					panic(err)
@@ -461,6 +699,9 @@ func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
 	hashes := map[uint64]struct{}{}
 	i := 0
 
+	memInfo, _ := mem.VirtualMemory()
+	fmt.Println(" before read, mem total-", memInfo.Total/1024/1024/1024, "G  mem used-", memInfo.Used/1024/1204/1204, "G  mem used percent-", memInfo.UsedPercent)
+
 	for scanner.Scan() && i < n {
 		m := make(labels.Labels, 0, 10)
 
@@ -483,6 +724,9 @@ func readPrometheusLabels(r io.Reader, n int) ([]labels.Labels, error) {
 		hashes[h] = struct{}{}
 		i++
 	}
+	memInfo, _ = mem.VirtualMemory()
+	fmt.Println("after read, mem total-", memInfo.Total/1024/1024/1024, "G mem used-", memInfo.Used/1024/1204/1204, "G mem used percent-", memInfo.UsedPercent)
+
 	return mets, nil
 }
 
@@ -703,3 +947,312 @@ func dumpSamples(db *tsdb.DBReadOnly, mint, maxt int64) (err error) {
 	}
 	return nil
 }
+
+func DBQuery111(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery1-1-1 ---------")
+
+	totalSamples := 0
+	host_matcher := host_matchers[rand.Intn(len(host_matchers))]
+	metric_matcher := Metric_Matchers[rand.Intn(len(Metric_Matchers))]
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(11*3600*1000, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+
+	//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+	// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+	ss, err := q.Select(host_matcher, metric_matcher)
+	total_select_duration := int(time.Since(start).Microseconds())
+
+	//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+	//mm := labels.NewEqualMatcher("region", "us-east-1")
+	//ss, err := q.Select(hs, mm)
+
+	if err != nil {
+		return err
+	}
+
+	start_get := time.Now()
+	for ss.Next() {
+		it := ss.At().Iterator()
+		for it.Next() {
+			totalSamples += 1
+		}
+	}
+	total_get_duration := int(time.Since(start_get).Microseconds())
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery1-1-1 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+func DBQuery1112(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery1-1-12 ---------")
+
+	totalSamples := 0
+	host_matcher := host_matchers[rand.Intn(len(host_matchers))]
+	metric_matcher := Metric_Matchers[rand.Intn(len(Metric_Matchers))]
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(0, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+
+	//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+	// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+	ss, err := q.Select(host_matcher, metric_matcher)
+	total_select_duration := int(time.Since(start).Microseconds())
+
+	//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+	//mm := labels.NewEqualMatcher("region", "us-east-1")
+	//ss, err := q.Select(hs, mm)
+
+	if err != nil {
+		return err
+	}
+
+	start_get := time.Now()
+	for ss.Next() {
+		it := ss.At().Iterator()
+		for it.Next() {
+			totalSamples += 1
+		}
+	}
+	total_get_duration := int(time.Since(start_get).Microseconds())
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery1-1-12 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+// Simple aggregrate (MAX) on one metric for 8 hosts, every 5 mins for 2 hour.
+func DBQuery181(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery1-8-1 ---------")
+
+	totalSamples := 0
+	total_select_duration := 0
+	total_get_duration := 0
+
+	metric_matcher := Metric_Matchers[1]
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(11*3600*1000, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+	total_select_duration += int(time.Since(start).Microseconds())
+
+	for j := 0; j < 8; j++ {
+		host_matcher := host_matchers[j]
+		//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+		// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+		start_select := time.Now()
+		ss, err := q.Select(host_matcher, metric_matcher)
+		total_select_duration += int(time.Since(start_select).Microseconds())
+
+		//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+		//mm := labels.NewEqualMatcher("region", "us-east-1")
+		//ss, err := q.Select(hs, mm)
+
+		if err != nil {
+			return err
+		}
+		start_get := time.Now()
+		for ss.Next() {
+			it := ss.At().Iterator()
+			for it.Next() {
+				totalSamples += 1
+			}
+		}
+		total_get_duration += int(time.Since(start_get).Microseconds())
+	}
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery1-8-1 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+func DBQuery1812(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery1-8-12 ---------")
+
+	totalSamples := 0
+
+	metric_matcher := Metric_Matchers[1]
+	total_select_duration := 0
+	total_get_duration := 0
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(0, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+	total_select_duration += int(time.Since(start).Microseconds())
+
+	for j := 0; j < 8; j++ {
+		host_matcher := host_matchers[j]
+		//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+		// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+		start_select := time.Now()
+		ss, err := q.Select(host_matcher, metric_matcher)
+		total_select_duration += int(time.Since(start_select).Microseconds())
+
+		//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+		//mm := labels.NewEqualMatcher("region", "us-east-1")
+		//ss, err := q.Select(hs, mm)
+
+		if err != nil {
+			return err
+		}
+		start_get := time.Now()
+		for ss.Next() {
+			it := ss.At().Iterator()
+			for it.Next() {
+				totalSamples += 1
+			}
+		}
+		total_get_duration += int(time.Since(start_get).Microseconds())
+	}
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery1-8-12 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+// Simple aggregrate (MAX) on one metric for 8 Metrics, every 5 mins for 2 hour.
+func DBQuery511(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery5-1-2 ---------")
+
+	totalSamples := 0
+	host_matcher := host_matchers[1]
+	total_select_duration := 0
+	total_get_duration := 0
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(11*3600*1000, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+	total_select_duration += int(time.Since(start).Microseconds())
+
+	for j := 0; j < 5; j++ {
+		metric_matcher := Metric_Matchers[j]
+		//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+		// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+		start_select := time.Now()
+		ss, err := q.Select(host_matcher, metric_matcher)
+		total_select_duration += int(time.Since(start_select).Microseconds())
+
+		//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+		//mm := labels.NewEqualMatcher("region", "us-east-1")
+		//ss, err := q.Select(hs, mm)
+
+		if err != nil {
+			return err
+		}
+		start_get := time.Now()
+		for ss.Next() {
+			it := ss.At().Iterator()
+			for it.Next() {
+				totalSamples += 1
+			}
+		}
+		total_get_duration += int(time.Since(start_get).Microseconds())
+	}
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery5-1-2 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+func DBQuery5112(db *tsdb.DB, host_matchers, Metric_Matchers []labels.Matcher, starts, ends []int64, write *bufio.Writer) error {
+	fmt.Println("-------- DBQuery5-1-12 ---------")
+
+	totalSamples := 0
+	host_matcher := host_matchers[1]
+	total_select_duration := 0
+	total_get_duration := 0
+
+	start := time.Now()
+	// the most recent two hrs, query_bench in a time range of 5 mins
+	//q 是一个querier的索引，指向 内建结构体 blocks （i.g., []Querier   Querier == block querier）
+	q, err := db.Querier(0, 12*3600*1000)
+	if err != nil {
+		println("err in Querier")
+		return err
+	}
+	total_select_duration += int(time.Since(start).Microseconds())
+
+	for j := 0; j < 5; j++ {
+		metric_matcher := Metric_Matchers[j]
+		//println("____________________________________________________________we select - ", host_matcher.String(), metric_matcher.String())
+		// querier.Select -> sel -> block querier.select -> block LookupChunkSeries -> PostingsForMatchers
+		start_select := time.Now()
+		ss, err := q.Select(host_matcher, metric_matcher)
+		total_select_duration += int(time.Since(start_select).Microseconds())
+
+		//hs := labels.NewEqualMatcher("host", strconv.Itoa(0))
+		//mm := labels.NewEqualMatcher("region", "us-east-1")
+		//ss, err := q.Select(hs, mm)
+
+		if err != nil {
+			return err
+		}
+		start_get := time.Now()
+		for ss.Next() {
+			it := ss.At().Iterator()
+			for it.Next() {
+				totalSamples += 1
+			}
+		}
+		total_get_duration += int(time.Since(start_get).Microseconds())
+	}
+
+	q.Close()
+	write.WriteString(" > Based on time range to locate target time slices. Go over posting lists of all target time slices, retrieve references of target TimeSeries, spend " + strconv.FormatUint(uint64(total_select_duration), 10) + "μs\n")
+	write.WriteString(" > read target data (based on references of target TS, retrieve data samples), spend " + strconv.FormatUint(uint64(total_get_duration), 10) + "μs\n")
+	write.WriteString("> complete stage=DBQuery5-1-12 duration=" + strconv.FormatUint(uint64(total_get_duration+total_select_duration), 10) + "μs\n")
+	write.WriteString("-----------------------------------------------\n")
+	write.Flush()
+	return nil
+}
+
+//TODO we dont do last point query because it is rare in tsdb. and the last point query should be identical in either case (longer or shorter flush period)
